@@ -37,7 +37,14 @@ run_as_root() {
     run_user="$2"
     shift 2
   fi
-  if [[ -n "$run_user" ]]; then
+  local current_user
+  current_user="$(id -un 2>/dev/null || echo root)"
+  # If we are already the target user, just exec directly.
+  # Avoids unnecessary `sudo -u` calls (which can fail on VPS / containers
+  # due to tty / sudoers / noexec-on-sudo-binary issues).
+  if [[ -n "$run_user" && "$current_user" == "$run_user" ]]; then
+    "$@"
+  elif [[ -n "$run_user" ]]; then
     sudo -u "$run_user" "$@"
   elif [[ "$(id -u)" -ne 0 ]]; then
     sudo "$@"
