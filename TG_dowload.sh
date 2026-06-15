@@ -17,7 +17,7 @@ _mount_has_noexec() {
 
 INSTALL_DIR_DEFAULT="${APP_HOME}/TG_download"
 if [[ "$(id -u)" -eq 0 && "$APP_HOME" == /root* ]] || _mount_has_noexec "$APP_HOME"; then
-  warn "Detected a noexec mount or root user; defaulting install dir to /opt/TG_download"
+  printf "\033[33m[%s]\033[0m Detected a noexec mount or root user; defaulting install dir to /opt/TG_download\n" "$APP_NAME"
   INSTALL_DIR_DEFAULT="/opt/TG_download"
 fi
 SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
