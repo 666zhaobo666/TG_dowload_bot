@@ -28,12 +28,20 @@ require_linux() {
 }
 
 run_as_root() {
-  if [[ "$(id -u)" -ne 0 ]]; then
+  local run_user=""
+  if [[ "${1:-}" == "-u" ]]; then
+    run_user="$2"
+    shift 2
+  fi
+  if [[ -n "$run_user" ]]; then
+    sudo -u "$run_user" "$@"
+  elif [[ "$(id -u)" -ne 0 ]]; then
     sudo "$@"
   else
     "$@"
   fi
 }
+
 
 service_exists() {
   systemctl list-unit-files | grep -q "^${SERVICE_NAME}\.service"
