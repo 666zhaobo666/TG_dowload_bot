@@ -227,47 +227,62 @@ configure_env() {
   if [[ ! -f "$existing" && -f "$defaults_file" ]]; then
     cp "$defaults_file" "$existing"
   fi
-
-  local current_api_id="" current_api_hash="" current_bot_token="" current_session="" current_proxy="" current_workers="5"
-  if [[ -f "$existing" ]]; then
-    current_api_id="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
-    current_api_hash="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
-    current_bot_token="$(grep '^TG_BOT_TOKEN=' "$existing" | cut -d= -f2- || true)"
-    current_session="$(grep '^TG_USER_SESSION=' "$existing" | cut -d= -f2- || true)"
-    current_proxy="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
-    current_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
+  local cur_api_id cur_api_hash cur_bot_token cur_session cur_proxy cur_workers
+  cur_api_id="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
+  cur_api_hash="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
+  cur_bot_token="$(grep '^TG_BOT_TOKEN=' "$existing" | cut -d= -f2- || true)"
+  cur_session="$(grep '^TG_USER_SESSION=' "$existing" | cut -d= -f2- || true)"
+  cur_proxy="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
+  cur_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
+  cur_workers="${cur_workers:-5}"
+  log "开始配置 TG Bot 参数。"
+  echo ""
+  local api_id_val api_hash_val bot_token_val proxy_val workers_val
+  api_id_val="$(prompt_default '告 TG API ID（输入后回车）' "$cur_api_id")"
+  echo ""
+  api_hash_val="$(prompt_default '告 TG API HASH（输入后回车保持不变）' "$cur_api_hash" true)"
+  echo ""
+  bot_token_val="$(prompt_default '告 TG Bot Token（输入后回车保持不变）' "$cur_bot_token" true)"
+  echo ""
+  proxy_val="$(prompt_default '告 TG 代理地址（可选，直接回车跳过）' "$cur_proxy")"
+  echo ""
+  workers_val="$(prompt_default '告 最大并发下载线程数（1-10，默讨 5）' "$cur_workers")"
+  workers_val="${workers_val:-5}"
+  echo ""
+  local session_val="$cur_session"
+  echo "TG User Session（用户登录帐证）："
+  echo "  当前状态：${session_val:+已配置}  ${session_val:+-}"
+  echo "  1) 重新生成（需要电话+验证码）"
+  echo "  2) 保持当前配置"
+  read -r -p "请选择 [2]: " sess_choice
+  sess_choice="${sess_choice:-2}"
+  if [[ "$sess_choice" == "1" ]]; then
+    if [[ -z "$api_id_val" || -z "$api_hash_val" ]]; then
+      err "生成 TG_USER_SESSION 需要先填写 TG API ID 和 API HASH"
+      echo "提示：重新运行本向导，先配置 API 参数。"
+    else
+      session_val="$(generate_user_session "$dir" "$api_id_val" "$api_hash_val" "$proxy_val")"
+    fi
   fi
-
-  log "Configure bot environment."
-  local api_id api_hash bot_token user_session tg_proxy max_workers
-  api_id="$(prompt_default 'TG_API_ID' "$current_api_id")"
-  api_hash="$(prompt_default 'TG_API_HASH' "$current_api_hash" true)"
-  bot_token="$(prompt_default 'TG_BOT_TOKEN' "$current_bot_token" true)"
-  tg_proxy="$(prompt_default 'TG_PROXY (optional)' "$current_proxy")"
-  user_session="$(generate_user_session "$dir" "$api_id" "$api_hash" "$tg_proxy")"
-  max_workers="$(prompt_default 'MAX_DOWNLOAD_WORKERS (1-10)' "$current_workers")"
-
-  cat > "$existing" <<EOF
-TG_API_ID=${api_id}
-TG_API_HASH=${api_hash}
-TG_BOT_TOKEN=${bot_token}
-TG_USER_SESSION=${user_session}
-TG_PROXY=${tg_proxy}
-MAX_DOWNLOAD_WORKERS=${max_workers}
-EOF
-  ok ".env updated: ${existing}"
+  echo ""
+  _set_env_var "$existing" "TG_API_ID" "$api_id_val"
+  _set_env_var "$existing" "TG_API_HASH" "$api_hash_val"
+  _set_env_var "$existing" "TG_BOT_TOKEN" "$bot_token_val"
+  _set_env_var "$existing" "TG_PROXY" "$proxy_val"
+  _set_env_var "$existing" "MAX_DOWNLOAD_WORKERS" "$workers_val"
+  _set_env_var "$existing" "TG_USER_SESSION" "$session_val"
+  ok "配置文件已保存：${existing}"
 }
 
 install_app() {
   require_linux
   ensure_packages
-
   local target_dir target_user target_group repo_url
   target_user="$APP_USER"
   target_group="$(id -gn "$target_user")"
-  target_dir="$(prompt_default 'Install directory' "$INSTALL_DIR_DEFAULT")"
+  target_dir="$(prompt_default '安装目录（直接回车使用默讨路径）' "$INSTALL_DIR_DEFAULT")"
   repo_url="$REPO_URL_DEFAULT"
-
+  echo ""
   run_as_root mkdir -p "$target_dir"
   if [[ -d "${target_dir}/.git" ]]; then
     run_as_root -u "$target_user" git -C "$target_dir" pull --ff-only
@@ -275,7 +290,6 @@ install_app() {
     run_as_root rm -rf "$target_dir"
     run_as_root -u "$target_user" git clone "$repo_url" "$target_dir"
   fi
-
   write_service_conf "$target_dir" "$target_user" "$target_group"
   setup_venv "$target_dir" "$target_user"
   configure_env "$target_dir"
@@ -283,16 +297,299 @@ install_app() {
   write_service_file "$target_dir" "$target_user" "$target_group"
   install_command_entry "$target_dir"
   run_as_root systemctl enable --now "${SERVICE_NAME}.service"
-  ok "Installation complete and service started."
-  ok "You can manage it later with: tgd"
+  ok "安装完成，服务已启动。"
+  ok "后续管理请使用：sudo tgd"
 }
 
 reconfigure_app() {
   local dir
   dir="$(install_dir)"
-  configure_env "$dir"
+  while true; do
+    echo ""
+    echo "========== 参数配置 =========="
+    echo "1) TG API 配置（API ID + API HASH）"
+    echo "2) TG Bot Token"
+    echo "3) TG 代理地址"
+    echo "4) TG User Session（用户登录帐证）"
+    echo "5) 最大并发线程数"
+    echo "6) 完整配置向导"
+    echo "0) 返回"
+    read -r -p "请选择: " choice
+    case "$choice" in
+      1) _reconfig_api "$dir" ;;
+      2) _reconfig_token "$dir" ;;
+      3) _reconfig_proxy "$dir" ;;
+      4) _reconfig_session "$dir" ;;
+      5) _reconfig_workers "$dir" ;;
+      6) configure_env "$dir" ; run_as_root systemctl restart "${SERVICE_NAME}.service" ; ok "配置已更新，服务重启中..." ;;
+      0) break ;;
+      *) err "无效选项，请重新选择" ;;
+    esac
+  done
+}
+
+_reconfig_api() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_id cur_hash new_id new_hash
+  cur_id="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
+  cur_hash="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
+  new_id="$(prompt_default '告 TG API ID（直接回车保持不变）' "$cur_id")"
+  echo ""
+  new_hash="$(prompt_default '告 TG API HASH（直接回车保持不变）' "$cur_hash" true)"
+  echo ""
+  [[ -n "$new_id" ]] && _set_env_var "$existing" "TG_API_ID" "$new_id"
+  [[ -n "$new_hash" ]] && _set_env_var "$existing" "TG_API_HASH" "$new_hash"
   run_as_root systemctl restart "${SERVICE_NAME}.service"
-  ok "Configuration updated and service restarted."
+  ok "API 配置已更新，服务重启中..."
+}
+
+_reconfig_token() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_token new_token
+  cur_token="$(grep '^TG_BOT_TOKEN=' "$existing" | cut -d= -f2- || true)"
+  new_token="$(prompt_default '告 TG Bot Token（直接回车保持不变）' "$cur_token" true)"
+  echo ""
+  [[ -n "$new_token" ]] && _set_env_var "$existing" "TG_BOT_TOKEN" "$new_token"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "Bot Token 已更新，服务重启中..."
+}
+
+_reconfig_proxy() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_proxy new_proxy
+  cur_proxy="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
+  new_proxy="$(prompt_default '告 TG 代理地址（直接回车保持不变）' "$cur_proxy")"
+  echo ""
+  _set_env_var "$existing" "TG_PROXY" "$new_proxy"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "代理配置已更新，服务重启中..."
+}
+
+_reconfig_session() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_session api_id_val api_hash_val proxy_val
+  cur_session="$(grep '^TG_USER_SESSION=' "$existing" | cut -d= -f2- || true)"
+  api_id_val="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
+  api_hash_val="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
+  proxy_val="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
+  echo "TG User Session（当前：${cur_session:+已配置}  ${cur_session:+-}）："
+  echo "1) 重新生成（需要电话+验证码）"
+  echo "2) 保持当前配置"
+  read -r -p "请选择 [2]: " ch
+  ch="${ch:-2}"
+  if [[ "$ch" == "1" ]]; then
+    if [[ -z "$api_id_val" || -z "$api_hash_val" ]]; then
+      err "生成 Session 需要先配置 TG API，请先选择第 1 项"
+    else
+      local new_session="$(generate_user_session "$dir" "$api_id_val" "$api_hash_val" "$proxy_val")"
+      _set_env_var "$existing" "TG_USER_SESSION" "$new_session"
+      run_as_root systemctl restart "${SERVICE_NAME}.service"
+      ok "Session 已更新，服务重启中..."
+    fi
+  fi
+}
+
+_reconfig_workers() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_workers new_workers
+  cur_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
+  cur_workers="${cur_workers:-5}"
+  new_workers="$(prompt_default '最大并发线程数（直接回车保持不变）' "$cur_workers")"
+  echo ""
+  [[ -n "$new_workers" ]] && _set_env_var "$existing" "MAX_DOWNLOAD_WORKERS" "$new_workers"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "线程数配置已更新，服务重启中..."
+}
+
+_set_env_var() {
+  local existing="$1"; local key="$2"; local val="$3"
+  if [[ -z "$val" ]]; then return; fi
+  local tmpfile="$(mktemp)"; local found=0
+  if [[ -f "$existing" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^${key}= ]]; then
+        echo "${key}=${val}" >> "$tmpfile"; found=1
+      else echo "$line" >> "$tmpfile"; fi
+    done < "$existing"
+  fi
+  [[ "$found" == "0" ]] && echo "${key}=${val}" >> "$tmpfile"
+  run_as_root mv "$tmpfile" "$existing"
+}
+
+_reconfig_api() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_id cur_hash new_id new_hash
+  cur_id="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
+  cur_hash="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
+  new_id="$(prompt_default 'TG API ID??????????' "$cur_id")"
+  echo ""
+  new_hash="$(prompt_default 'TG API HASH??????????' "$cur_hash" true)"
+  echo ""
+  [[ -n "$new_id" ]] && _set_env_var "$existing" "TG_API_ID" "$new_id"
+  [[ -n "$new_hash" ]] && _set_env_var "$existing" "TG_API_HASH" "$new_hash"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "API ???????????..."
+}
+
+_reconfig_token() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_token new_token
+  cur_token="$(grep '^TG_BOT_TOKEN=' "$existing" | cut -d= -f2- || true)"
+  new_token="$(prompt_default 'TG Bot Token??????????' "$cur_token" true)"
+  echo ""
+  [[ -n "$new_token" ]] && _set_env_var "$existing" "TG_BOT_TOKEN" "$new_token"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "Bot Token ?????????..."
+}
+
+_reconfig_proxy() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_proxy new_proxy
+  cur_proxy="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
+  new_proxy="$(prompt_default 'TG ??????????????' "$cur_proxy")"
+  echo ""
+  _set_env_var "$existing" "TG_PROXY" "$new_proxy"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "?????????????..."
+}
+
+_reconfig_session() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_session api_id_val api_hash_val proxy_val
+  cur_session="$(grep '^TG_USER_SESSION=' "$existing" | cut -d= -f2- || true)"
+  api_id_val="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
+  api_hash_val="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
+  proxy_val="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
+  echo "TG User Session????${cur_session:+???}  ${cur_session:+-}??"
+  echo "1) ?????????+????"
+  echo "2) ??????"
+  read -r -p "??? [2]: " ch
+  ch="${ch:-2}"
+  if [[ "$ch" == "1" ]]; then
+    if [[ -z "$api_id_val" || -z "$api_hash_val" ]]; then
+      err "?? Session ????? TG API?????? 1 ?"
+    else
+      local new_session="$(generate_user_session "$dir" "$api_id_val" "$api_hash_val" "$proxy_val")"
+      _set_env_var "$existing" "TG_USER_SESSION" "$new_session"
+      run_as_root systemctl restart "${SERVICE_NAME}.service"
+      ok "Session ?????????..."
+    fi
+  fi
+}
+
+_reconfig_workers() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_workers new_workers
+  cur_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
+  cur_workers="${cur_workers:-5}"
+  new_workers="$(prompt_default '?????????????????' "$cur_workers")"
+  echo ""
+  [[ -n "$new_workers" ]] && _set_env_var "$existing" "MAX_DOWNLOAD_WORKERS" "$new_workers"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "??????????????..."
+}
+
+_set_env_var() {
+  local existing="$1"; local key="$2"; local val="$3"
+  if [[ -z "$val" ]]; then return; fi
+  local tmpfile="$(mktemp)"; local found=0
+  if [[ -f "$existing" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^${key}= ]]; then
+        echo "${key}=${val}" >> "$tmpfile"; found=1
+      else echo "$line" >> "$tmpfile"; fi
+    done < "$existing"
+  fi
+  [[ "$found" == "0" ]] && echo "${key}=${val}" >> "$tmpfile"
+  run_as_root mv "$tmpfile" "$existing"
+}
+
+_reconfig_api() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_id cur_hash new_id new_hash
+  cur_id="$(grep '"'"'^TG_API_ID='"'"' "$existing" | cut -d= -f2- || true)"
+  cur_hash="$(grep '"'"'^TG_API_HASH='"'"' "$existing" | cut -d= -f2- || true)"
+  new_id="$(prompt_default '"'"'TG API ID??????????'"'"' "$cur_id")"
+  echo ""
+  new_hash="$(prompt_default '"'"'TG API HASH??????????'"'"' "$cur_hash" true)"
+  echo ""
+  [[ -n "$new_id" ]] && _set_env_var "$existing" "TG_API_ID" "$new_id"
+  [[ -n "$new_hash" ]] && _set_env_var "$existing" "TG_API_HASH" "$new_hash"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "API ???????????..."
+}
+
+_reconfig_token() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_token new_token
+  cur_token="$(grep '"'"'^TG_BOT_TOKEN='"'"' "$existing" | cut -d= -f2- || true)"
+  new_token="$(prompt_default '"'"'TG Bot Token??????????'"'"' "$cur_token" true)"
+  echo ""
+  [[ -n "$new_token" ]] && _set_env_var "$existing" "TG_BOT_TOKEN" "$new_token"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "Bot Token ?????????..."
+}
+
+_reconfig_proxy() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_proxy new_proxy
+  cur_proxy="$(grep '"'"'^TG_PROXY='"'"' "$existing" | cut -d= -f2- || true)"
+  new_proxy="$(prompt_default '"'"'TG ??????????????'"'"' "$cur_proxy")"
+  echo ""
+  _set_env_var "$existing" "TG_PROXY" "$new_proxy"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "?????????????..."
+}
+
+_reconfig_session() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_session api_id_val api_hash_val proxy_val
+  cur_session="$(grep '"'"'^TG_USER_SESSION='"'"' "$existing" | cut -d= -f2- || true)"
+  api_id_val="$(grep '"'"'^TG_API_ID='"'"' "$existing" | cut -d= -f2- || true)"
+  api_hash_val="$(grep '"'"'^TG_API_HASH='"'"' "$existing" | cut -d= -f2- || true)"
+  proxy_val="$(grep '"'"'^TG_PROXY='"'"' "$existing" | cut -d= -f2- || true)"
+  echo "TG User Session????${cur_session:+???}  ${cur_session:+-}??"
+  echo "1) ?????????+????"
+  echo "2) ??????"
+  read -r -p "??? [2]: " ch
+  ch="${ch:-2}"
+  if [[ "$ch" == "1" ]]; then
+    if [[ -z "$api_id_val" || -z "$api_hash_val" ]]; then
+      err "?? Session ????? TG API?????? 1 ?"
+    else
+      local new_session="$(generate_user_session "$dir" "$api_id_val" "$api_hash_val" "$proxy_val")"
+      _set_env_var "$existing" "TG_USER_SESSION" "$new_session"
+      run_as_root systemctl restart "${SERVICE_NAME}.service"
+      ok "Session ?????????..."
+    fi
+  fi
+}
+
+_reconfig_workers() {
+  local dir="$1"; local existing="${dir}/.env"
+  local cur_workers new_workers
+  cur_workers="$(grep '"'"'^MAX_DOWNLOAD_WORKERS='"'"' "$existing" | cut -d= -f2- || true)"
+  cur_workers="${cur_workers:-5}"
+  new_workers="$(prompt_default '"'"'?????????????????'"'"' "$cur_workers")"
+  echo ""
+  [[ -n "$new_workers" ]] && _set_env_var "$existing" "MAX_DOWNLOAD_WORKERS" "$new_workers"
+  run_as_root systemctl restart "${SERVICE_NAME}.service"
+  ok "??????????????..."
+}
+
+_set_env_var() {
+  local existing="$1"; local key="$2"; local val="$3"
+  if [[ -z "$val" ]]; then return; fi
+  local tmpfile="$(mktemp)"; local found=0
+  if [[ -f "$existing" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^${key}= ]]; then
+        echo "${key}=${val}" >> "$tmpfile"; found=1
+      else echo "$line" >> "$tmpfile"; fi
+    done < "$existing"
+  fi
+  [[ "$found" == "0" ]] && echo "${key}=${val}" >> "$tmpfile"
+  run_as_root mv "$tmpfile" "$existing"
 }
 
 start_service() {
@@ -332,26 +629,26 @@ uninstall_app() {
 
 
 show_install_menu() {
-  echo "1) Install"
-  echo "0) Exit"
-  read -r -p "Choose: " choice
+  echo "1) 安装"
+  echo "0) 退出"
+  read -r -p "请选择: " choice
   case "$choice" in
     1) install_app ;;
     0) exit 0 ;;
-    *) err "Invalid choice." ; exit 1 ;;
+    *) err "无效选项。" ; exit 1 ;;
   esac
 }
 
 
 show_manage_menu() {
-  echo "1) Reconfigure"
-  echo "2) Start service"
-  echo "3) Restart service"
-  echo "4) Stop service"
-  echo "5) Service status"
-  echo "6) Uninstall"
-  echo "0) Exit"
-  read -r -p "Choose: " choice
+  echo "1) 重配置"
+  echo "2) 启动服务"
+  echo "3) 重启服务"
+  echo "4) 停止服务"
+  echo "5) 服务状态"
+  echo "6) 卸载"
+  echo "0) 退出"
+  read -r -p "请选择: " choice
   case "$choice" in
     1) reconfigure_app ;;
     2) start_service ;;
@@ -360,7 +657,7 @@ show_manage_menu() {
     5) status_service ;;
     6) uninstall_app ;;
     0) exit 0 ;;
-    *) err "Invalid choice." ; exit 1 ;;
+    *) err "无效选项。" ; exit 1 ;;
   esac
 }
 
@@ -374,3 +671,5 @@ main() {
 }
 
 main "$@"
+
+
