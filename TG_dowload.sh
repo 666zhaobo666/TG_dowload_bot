@@ -7,7 +7,7 @@ APP_USER="${SUDO_USER:-$USER}"
 APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6 2>/dev/null || printf '%s' "$HOME")"
 INSTALL_DIR_DEFAULT="${APP_HOME}/TG_download"
 SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
-REPO_URL_DEFAULT="https://github.com/666zhaobo666/TG_dowload_bot.git"
+REPO_URL_DEFAULT="https://proxy.cccg.top/github.com/666zhaobo666/TG_dowload_bot.git"
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -322,16 +322,6 @@ uninstall_app() {
   ok "Uninstalled."
 }
 
-show_install_menu() {
-  echo "1) Install"
-  echo "0) Exit"
-  read -r -p "Choose: " choice
-  case "$choice" in
-    1) install_app ;;
-    0) exit 0 ;;
-    *) err "Invalid choice." ; exit 1 ;;
-  esac
-}
 
 show_manage_menu() {
   echo "1) Reconfigure"
@@ -359,7 +349,7 @@ main() {
   if is_installed; then
     show_manage_menu
   else
-    show_install_menu
+    install_app
   fi
 }
 
