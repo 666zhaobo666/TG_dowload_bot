@@ -1,0 +1,4 @@
+telethon>=1.43.0
+python-dotenv>=1.0.1
+PySocks>=1.7.1
+python-socks[asyncio]>=2.5.3
