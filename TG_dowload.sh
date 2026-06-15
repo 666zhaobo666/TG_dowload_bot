@@ -118,6 +118,25 @@ prompt_default() {
   printf "%s" "$value"
 }
 
+normalize_linux_path() {
+  local path="$1"
+
+  path="${path//$'\r'/}"
+  path="${path//$'\n'/}"
+  path="$(printf '%s' "$path" | sed 's#//*#/#g')"
+
+  if [[ -z "$path" || "$path" != /* ]]; then
+    err "安装目录必须是 Linux 绝对路径，例如 /opt/TG_download 或 /home/<user>/TG_download。"
+    exit 1
+  fi
+
+  if [[ "$path" != "/" ]]; then
+    path="${path%/}"
+  fi
+
+  printf "%s" "$path"
+}
+
 generate_user_session() {
   local dir="$1"
   local api_id="$2"
@@ -377,9 +396,11 @@ install_app() {
   target_user="$APP_USER"
   target_group="$(id -gn "$target_user")"
   target_dir="$(prompt_default '安装目录' "$INSTALL_DIR_DEFAULT")"
+  target_dir="$(normalize_linux_path "$target_dir")"
   repo_url="$REPO_URL_DEFAULT"
 
   echo ""
+  log "安装目录：$target_dir"
   run_as_root mkdir -p "$target_dir"
 
   if [[ -d "${target_dir}/.git" ]]; then
