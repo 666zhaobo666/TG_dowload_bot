@@ -7,7 +7,7 @@ APP_USER="${SUDO_USER:-$USER}"
 APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6 2>/dev/null || printf '%s' "$HOME")"
 INSTALL_DIR_DEFAULT="${APP_HOME}/TG_download"
 SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
-REPO_URL_DEFAULT="${TG_DOWNLOAD_BOT_REPO_URL:-https://github.com/REPLACE_ME/TG_dowload_bot.git}"
+REPO_URL_DEFAULT="https://github.com/666zhaobo666/TG_dowload_bot.git"
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -258,7 +258,7 @@ install_app() {
   target_user="$APP_USER"
   target_group="$(id -gn "$target_user")"
   target_dir="$(prompt_default 'Install directory' "$INSTALL_DIR_DEFAULT")"
-  repo_url="$(prompt_default 'Git repository URL' "$REPO_URL_DEFAULT")"
+  repo_url="$REPO_URL_DEFAULT"
 
   run_as_root mkdir -p "$target_dir"
   if [[ -d "${target_dir}/.git" ]]; then
