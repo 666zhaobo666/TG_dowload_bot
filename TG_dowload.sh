@@ -208,7 +208,7 @@ User=${user}
 Group=${group}
 WorkingDirectory=${dir}
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${dir}/.venv/bin/python ${dir}/tg_archiver_bot.py
+ExecStart="${dir}/.venv/bin/python" "${dir}/tg_archiver_bot.py"
 Restart=always
 RestartSec=3
 
@@ -285,6 +285,11 @@ configure_env() {
   cur_session="$(grep '^TG_USER_SESSION=' "$existing" | cut -d= -f2- || true)"
   cur_proxy="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
   cur_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
+  [[ "$cur_api_id" == "123456" ]] && cur_api_id=""
+  [[ "$cur_api_hash" == "your_api_hash" ]] && cur_api_hash=""
+  [[ "$cur_bot_token" == "123456:your_bot_token" ]] && cur_bot_token=""
+  [[ "$cur_session" == "replace_with_your_string_session" ]] && cur_session=""
+  [[ "$cur_proxy" == "socks5://127.0.0.1:10808" ]] && cur_proxy=""
   cur_workers="${cur_workers:-5}"
 
   log "开始配置 Telegram Bot 参数。"
