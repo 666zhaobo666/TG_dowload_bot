@@ -323,6 +323,18 @@ uninstall_app() {
 }
 
 
+show_install_menu() {
+  echo "1) Install"
+  echo "0) Exit"
+  read -r -p "Choose: " choice
+  case "$choice" in
+    1) install_app ;;
+    0) exit 0 ;;
+    *) err "Invalid choice." ; exit 1 ;;
+  esac
+}
+
+
 show_manage_menu() {
   echo "1) Reconfigure"
   echo "2) Start service"
@@ -349,7 +361,7 @@ main() {
   if is_installed; then
     show_manage_menu
   else
-    install_app
+    show_install_menu
   fi
 }
 
