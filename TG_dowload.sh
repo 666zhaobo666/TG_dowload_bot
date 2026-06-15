@@ -25,7 +25,7 @@ ok() { printf "%b[%s]%b %s\n" "$GREEN" "$APP_NAME" "$RESET" "$*"; }
 
 require_linux() {
   if [[ "$(uname -s)" != "Linux" ]]; then
-    err "This manager only supports Linux."
+    err "该管理脚本仅支持 Linux 系统。"
     exit 1
   fi
 }
@@ -92,7 +92,7 @@ ensure_packages() {
   elif command -v yum >/dev/null 2>&1; then
     run_as_root yum install -y git curl python3 python3-venv
   else
-    err "Unsupported package manager. Please install git, curl, python3, and python3-venv manually."
+    err "暂不支持当前包管理器，请手动安装 git、curl、python3 和 python3-venv。"
     exit 1
   fi
 }
@@ -125,11 +125,11 @@ generate_user_session() {
   local tg_proxy="${4:-}"
 
   if [[ -z "$api_id" || -z "$api_hash" ]]; then
-    err "TG_API_ID and TG_API_HASH are required to generate TG_USER_SESSION."
+    err "生成 TG_USER_SESSION 需要先填写 TG_API_ID 和 TG_API_HASH。"
     return 1
   fi
 
-  log "Generating TG_USER_SESSION. You will be prompted for phone and verification code."
+  log "正在生成 TG_USER_SESSION，接下来会提示输入手机号和验证码。"
   local tmpfile
   tmpfile="$(mktemp)"
 
@@ -141,12 +141,12 @@ generate_user_session() {
   rm -f "$tmpfile"
 
   if [[ -n "$session" ]]; then
-    ok "TG_USER_SESSION generated."
+    ok "TG_USER_SESSION 生成成功。"
     printf "%s" "$session"
     return 0
   fi
 
-  err "Failed to generate TG_USER_SESSION."
+  err "TG_USER_SESSION 生成失败。"
   return 1
 }
 
@@ -160,7 +160,7 @@ parse_alias_paths() {
     [[ -z "$entry" ]] && continue
 
     if [[ "$entry" != *=* ]]; then
-      err "Invalid directory alias entry: $entry"
+      err "目录别名格式无效：$entry"
       exit 1
     fi
 
@@ -170,7 +170,7 @@ parse_alias_paths() {
     alias_path="$(printf '%s' "$alias_path" | xargs)"
 
     if [[ ! "$alias_path" = /* ]]; then
-      err "Directory path for alias '$alias_name' must be an absolute Linux path."
+      err "目录别名 '$alias_name' 对应的路径必须是 Linux 绝对路径。"
       exit 1
     fi
 
@@ -244,8 +244,8 @@ check_exec_mount() {
     local opts
     opts="$(findmnt -no OPTIONS -T "$dir" 2>/dev/null || true)"
     if [[ "$opts" == *noexec* ]]; then
-      err "The filesystem for ${dir} is mounted with noexec."
-      err "Virtualenv binaries cannot run there. Please reinstall under an executable path such as /home/<user>/TG_download."
+      err "${dir} 所在文件系统使用了 noexec 挂载选项。"
+      err "虚拟环境里的可执行文件无法运行，请改装到可执行目录，例如 /home/<user>/TG_download。"
       exit 1
     fi
   fi
@@ -260,8 +260,8 @@ setup_venv() {
   run_as_root -u "$user" python3 -m venv "${dir}/.venv"
 
   if [[ ! -x "$venv_python" ]]; then
-    err "Virtualenv python is not executable: ${venv_python}"
-    err "Check directory permissions or whether the install path is mounted with noexec."
+    err "虚拟环境 Python 不可执行：${venv_python}"
+    err "请检查目录权限，或确认安装路径是否被 noexec 挂载。"
     exit 1
   fi
 
@@ -287,37 +287,37 @@ configure_env() {
   cur_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
   cur_workers="${cur_workers:-5}"
 
-  log "Starting Telegram bot configuration."
+  log "开始配置 Telegram Bot 参数。"
   echo ""
 
   local api_id_val api_hash_val bot_token_val proxy_val workers_val
-  api_id_val="$(prompt_default 'Enter TG API ID' "$cur_api_id")"
+  api_id_val="$(prompt_default '请输入 TG API ID' "$cur_api_id")"
   echo ""
-  api_hash_val="$(prompt_default 'Enter TG API HASH' "$cur_api_hash" true)"
+  api_hash_val="$(prompt_default '请输入 TG API HASH' "$cur_api_hash" true)"
   echo ""
-  bot_token_val="$(prompt_default 'Enter TG Bot Token' "$cur_bot_token" true)"
+  bot_token_val="$(prompt_default '请输入 TG Bot Token' "$cur_bot_token" true)"
   echo ""
-  proxy_val="$(prompt_default 'Enter TG proxy URL (optional)' "$cur_proxy")"
+  proxy_val="$(prompt_default '请输入 TG 代理地址（可选）' "$cur_proxy")"
   echo ""
-  workers_val="$(prompt_default 'Enter max download workers (1-10)' "$cur_workers")"
+  workers_val="$(prompt_default '请输入最大下载并发数（1-10）' "$cur_workers")"
   workers_val="${workers_val:-5}"
   echo ""
 
   local session_val="$cur_session"
-  echo "TG User Session:"
+  echo "TG User Session："
   if [[ -n "$session_val" ]]; then
-    echo "  Current status: configured"
+    echo "  当前状态：已配置"
   else
-    echo "  Current status: not configured"
+    echo "  当前状态：未配置"
   fi
-  echo "  1) Regenerate session"
-  echo "  2) Keep current session"
-  read -r -p "Choose [2]: " sess_choice
+  echo "  1) 重新生成 Session"
+  echo "  2) 保持当前 Session"
+  read -r -p "请选择 [2]: " sess_choice
   sess_choice="${sess_choice:-2}"
 
   if [[ "$sess_choice" == "1" ]]; then
     if [[ -z "$api_id_val" || -z "$api_hash_val" ]]; then
-      err "TG API ID and TG API HASH are required before generating TG_USER_SESSION."
+      err "生成 TG_USER_SESSION 前，必须先填写 TG API ID 和 TG API HASH。"
     else
       session_val="$(generate_user_session "$dir" "$api_id_val" "$api_hash_val" "$proxy_val")"
     fi
@@ -330,7 +330,7 @@ configure_env() {
   _set_env_var "$existing" "TG_PROXY" "$proxy_val"
   _set_env_var "$existing" "MAX_DOWNLOAD_WORKERS" "$workers_val"
   _set_env_var "$existing" "TG_USER_SESSION" "$session_val"
-  ok "Configuration saved to ${existing}"
+  ok "配置已保存到 ${existing}"
 }
 
 _set_env_var() {
@@ -371,7 +371,7 @@ install_app() {
   local target_dir target_user target_group repo_url
   target_user="$APP_USER"
   target_group="$(id -gn "$target_user")"
-  target_dir="$(prompt_default 'Install directory' "$INSTALL_DIR_DEFAULT")"
+  target_dir="$(prompt_default '安装目录' "$INSTALL_DIR_DEFAULT")"
   repo_url="$REPO_URL_DEFAULT"
 
   echo ""
@@ -392,8 +392,8 @@ install_app() {
   install_command_entry "$target_dir"
   run_as_root systemctl enable --now "${SERVICE_NAME}.service"
 
-  ok "Installation completed and service started."
-  ok "Use 'sudo tgd' for later management."
+  ok "安装完成，服务已启动。"
+  ok "后续可使用 'sudo tgd' 进行管理。"
 }
 
 reconfigure_app() {
@@ -402,22 +402,22 @@ reconfigure_app() {
 
   configure_env "$dir"
   run_as_root systemctl restart "${SERVICE_NAME}.service"
-  ok "Configuration updated and service restarted."
+  ok "配置已更新，服务已重启。"
 }
 
 start_service() {
   run_as_root systemctl start "${SERVICE_NAME}.service"
-  ok "Service started."
+  ok "服务已启动。"
 }
 
 restart_service() {
   run_as_root systemctl restart "${SERVICE_NAME}.service"
-  ok "Service restarted."
+  ok "服务已重启。"
 }
 
 stop_service() {
   run_as_root systemctl stop "${SERVICE_NAME}.service"
-  ok "Service stopped."
+  ok "服务已停止。"
 }
 
 status_service() {
@@ -428,7 +428,7 @@ uninstall_app() {
   local dir
   dir="$(install_dir)"
 
-  read -r -p "This will stop the service and remove ${dir}. Continue? [y/N]: " confirm
+  read -r -p "这将停止服务并删除 ${dir}，确认继续吗？[y/N]: " confirm
   [[ "${confirm,,}" == "y" ]] || exit 0
 
   if service_exists; then
@@ -440,30 +440,30 @@ uninstall_app() {
 
   run_as_root rm -f "$SCRIPT_INSTALL_PATH"
   run_as_root rm -rf "$dir"
-  ok "Uninstalled."
+  ok "卸载完成。"
 }
 
 show_install_menu() {
-  echo "1) Install"
-  echo "0) Exit"
-  read -r -p "Choose: " choice
+  echo "1) 安装"
+  echo "0) 退出"
+  read -r -p "请选择： " choice
 
   case "$choice" in
     1) install_app ;;
     0) exit 0 ;;
-    *) err "Invalid option."; exit 1 ;;
+    *) err "无效选项。"; exit 1 ;;
   esac
 }
 
 show_manage_menu() {
-  echo "1) Reconfigure"
-  echo "2) Start service"
-  echo "3) Restart service"
-  echo "4) Stop service"
-  echo "5) Service status"
-  echo "6) Uninstall"
-  echo "0) Exit"
-  read -r -p "Choose: " choice
+  echo "1) 重新配置"
+  echo "2) 启动服务"
+  echo "3) 重启服务"
+  echo "4) 停止服务"
+  echo "5) 查看服务状态"
+  echo "6) 卸载"
+  echo "0) 退出"
+  read -r -p "请选择： " choice
 
   case "$choice" in
     1) reconfigure_app ;;
@@ -473,7 +473,7 @@ show_manage_menu() {
     5) status_service ;;
     6) uninstall_app ;;
     0) exit 0 ;;
-    *) err "Invalid option."; exit 1 ;;
+    *) err "无效选项。"; exit 1 ;;
   esac
 }
 
