@@ -5,62 +5,10 @@ APP_NAME="TG_dowload_bot"
 SERVICE_NAME="tg-download-bot"
 APP_USER="${SUDO_USER:-$USER}"
 APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6 2>/dev/null || printf '%s' "$HOME")"
-
-# Detect "noexec" mount on a given path. Tries multiple methods because
-# some minimal containers / VPS lack findmnt. Common on /root or / in
-# OpenVZ and many Chinese VPS providers.
-_mount_has_noexec() {
-  local target="$1"
-  # Method 1: findmnt (preferred)
-  if command -v findmnt >/dev/null 2>&1; then
-    local opts
-    opts="$(findmnt -no OPTIONS --target "$target" 2>/dev/null || true)"
-    [[ "$opts" == *noexec* ]] && return 0
-  fi
-  # Method 2: scan /proc/mounts for the deepest mount containing target
-  if [[ -r /proc/mounts ]]; then
-    local line mp
-    mp=""
-    while IFS= read -r line; do
-      # fields: dev mountpoint fstype options dump pass
-      set -- $line
-      local mnt="$2"
-      case "$mnt" in proc|sys|dev|run/*) continue ;; esac
-      case "$target" in
-        "$mnt"|"$mnt"/*) mp="$mnt" ;;
-      esac
-    done < /proc/mounts
-    if [[ -n "$mp" ]] && grep -E " ${mp} " /proc/mounts | grep -qw noexec; then
-      return 0
-    fi
-  fi
-  # Method 3: actually try to exec a probe file on the target fs
-  if [[ -d "$target" ]]; then
-    local probe
-    probe="$(mktemp "$target/.execprobe.XXXXXX" 2>/dev/null || true)"
-    if [[ -n "$probe" ]]; then
-      printf '#!/bin/sh\nexit 0\n' > "$probe" 2>/dev/null
-      chmod +x "$probe" 2>/dev/null
-      if ! "$probe" >/dev/null 2>&1; then
-        rm -f "$probe"
-        return 0
-      fi
-      rm -f "$probe"
-    fi
-  fi
-  return 1
-}
-
 INSTALL_DIR_DEFAULT="${APP_HOME}/TG_download"
-USE_VENV=1
-if [[ "$(id -u)" -eq 0 && "$APP_HOME" == /root* ]] || _mount_has_noexec "$APP_HOME"; then
-  printf "\033[33m[%s]\033[0m Detected a noexec mount or root user; defaulting install dir to /opt/TG_download\n" "$APP_NAME"
+# When running as root on a typical VPS, default to /opt to avoid /root permission quirks.
+if [[ "$(id -u)" -eq 0 && "$APP_HOME" == /root* ]]; then
   INSTALL_DIR_DEFAULT="/opt/TG_download"
-fi
-# Re-check the resolved install dir; if it's still on noexec, drop the venv plan.
-if _mount_has_noexec "$INSTALL_DIR_DEFAULT"; then
-  USE_VENV=0
-  printf "\033[33m[%s]\033[0m Install dir %s is on a noexec mount. Will build the venv in tmpfs (/dev/shm) so the binaries can be executed.\n" "$APP_NAME" "$INSTALL_DIR_DEFAULT"
 fi
 SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
 REPO_URL_DEFAULT="https://proxy.cccg.top/github.com/666zhaobo666/TG_dowload_bot.git"
@@ -230,18 +178,6 @@ write_service_file() {
   local dir="$1"
   local user="$2"
   local group="$3"
-  local python_bin="${dir}/.venv/bin/python"
-  local pre_start=""
-
-  # If the venv lives on a tmpfs (noexec mode), make sure it exists before
-  # we try to start: /dev/shm is wiped on every reboot, so we rebuild it
-  # on demand. Normal (non-noexec) installs skip this.
-  if [[ -f "${dir}/.venv-shm-path" ]]; then
-    local shm_venv
-    shm_venv="$(cat "${dir}/.venv-shm-path")"
-    pre_start="ExecStartPre=/bin/sh -c 'if [ ! -x \"${shm_venv}/bin/pip\" ]; then rm -rf \"${shm_venv}\" && /usr/bin/python3 -m venv \"${shm_venv}\" && \"${shm_venv}/bin/pip\" install -r \"${dir}/requirements.txt\"; fi'"
-  fi
-
   run_as_root tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<EOF
 [Unit]
 Description=Telegram Download Bot
@@ -253,8 +189,7 @@ User=${user}
 Group=${group}
 WorkingDirectory=${dir}
 Environment=PYTHONUNBUFFERED=1
-${pre_start}
-ExecStart=${python_bin} ${dir}/tg_archiver_bot.py
+ExecStart=${dir}/.venv/bin/python ${dir}/tg_archiver_bot.py
 Restart=always
 RestartSec=3
 
@@ -284,48 +219,9 @@ ensure_owner() {
 setup_venv() {
   local dir="$1"
   local user="$2"
-
-  # If the install dir is on a noexec mount, build the venv on a tmpfs
-  # (typically /dev/shm) which is always exec-capable, then symlink it back.
-  if [[ "$USE_VENV" -eq 0 ]] || _mount_has_noexec "$dir"; then
-    printf "\033[33m[%s]\033[0m noexec detected on %s; building venv in tmpfs instead.\n" "$APP_NAME" "$dir"
-
-    # Pick the first exec-capable tmpfs we can find.
-    local venv_root=""
-    for cand in /dev/shm/tg-download-venv /run/tg-download-venv /tmp/tg-download-venv; do
-      local parent
-      parent="$(dirname "$cand")"
-      if [[ -d "$parent" ]] && ! _mount_has_noexec "$parent"; then
-        venv_root="$cand"
-        break
-      fi
-    done
-    if [[ -z "$venv_root" ]]; then
-      err "Could not find any exec-capable tmpfs (tried /dev/shm, /run, /tmp)."
-      err "Please remount your root filesystem with exec permission, e.g.: mount -o remount,exec /"
-      exit 1
-    fi
-
-    # Recreate the venv cleanly on the tmpfs.
-    run_as_root rm -rf "$venv_root"
-    run_as_root -u "$user" python3 -m venv "$venv_root"
-    run_as_root -u "$user" "$venv_root/bin/pip" install --upgrade pip
-    run_as_root -u "$user" "$venv_root/bin/pip" install -r "${dir}/requirements.txt"
-
-    # Symlink ${dir}/.venv -> tmpfs venv so the rest of the script keeps working.
-    run_as_root rm -rf "${dir}/.venv"
-    run_as_root ln -s "$venv_root" "${dir}/.venv"
-
-    # Record the real venv path so the systemd unit can rebuild it on boot
-    # (tmpfs is cleared on reboot).
-    printf '%s\n' "$venv_root" > "${dir}/.venv-shm-path"
-    return 0
-  fi
-
   run_as_root -u "$user" python3 -m venv "${dir}/.venv"
   run_as_root -u "$user" "${dir}/.venv/bin/pip" install --upgrade pip
   run_as_root -u "$user" "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt"
-  rm -f "${dir}/.venv-shm-path"
 }
 
 configure_env() {
