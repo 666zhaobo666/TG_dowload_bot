@@ -5,7 +5,21 @@ APP_NAME="TG_dowload_bot"
 SERVICE_NAME="tg-download-bot"
 APP_USER="${SUDO_USER:-$USER}"
 APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6 2>/dev/null || printf '%s' "$HOME")"
+
+# Detect "noexec" mount on APP_HOME (common on /root in many VPS / OpenVZ environments).
+_mount_has_noexec() {
+  local target="$1"
+  command -v findmnt >/dev/null 2>&1 || return 1
+  local opts
+  opts="$(findmnt -no OPTIONS --target "$target" 2>/dev/null || true)"
+  [[ "$opts" == *noexec* ]]
+}
+
 INSTALL_DIR_DEFAULT="${APP_HOME}/TG_download"
+if [[ "$(id -u)" -eq 0 && "$APP_HOME" == /root* ]] || _mount_has_noexec "$APP_HOME"; then
+  warn "Detected a noexec mount or root user; defaulting install dir to /opt/TG_download"
+  INSTALL_DIR_DEFAULT="/opt/TG_download"
+fi
 SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
 REPO_URL_DEFAULT="https://proxy.cccg.top/github.com/666zhaobo666/TG_dowload_bot.git"
 
@@ -215,6 +229,15 @@ ensure_owner() {
 setup_venv() {
   local dir="$1"
   local user="$2"
+
+  # Sanity check: refuse to create the venv on a noexec filesystem,
+  # otherwise pip/python inside the venv will fail with "Permission denied".
+  if _mount_has_noexec "$dir"; then
+    err "Install directory $dir is on a noexec mount; venv binaries will not be executable."
+    err "Please re-run the installer and choose a directory on a normal mount (e.g. /opt/TG_download)."
+    exit 1
+  fi
+
   run_as_root -u "$user" python3 -m venv "${dir}/.venv"
   run_as_root -u "$user" "${dir}/.venv/bin/pip" install --upgrade pip
   run_as_root -u "$user" "${dir}/.venv/bin/pip" install -r "${dir}/requirements.txt"
