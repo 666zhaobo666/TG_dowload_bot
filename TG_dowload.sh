@@ -99,6 +99,7 @@ prompt_default() {
     printf "\n"
   else
     read -r -p "${prompt} [${default}]: " value
+    printf "\n"
   fi
   if [[ -z "$value" ]]; then
     value="$default"
@@ -106,6 +107,34 @@ prompt_default() {
   printf "%s" "$value"
 }
 
+
+generate_user_session() {
+  local dir="$1"
+  local api_id="$2"
+  local api_hash="$3"
+  local tg_proxy="${4:-}"
+
+  if [[ -z "$api_id" || -z "$api_hash" ]]; then
+    err "TG_API_ID and TG_API_HASH are required to generate TG_USER_SESSION"
+    return 1
+  fi
+
+  log "Generating TG_USER_SESSION (you will be prompted for phone + verification code)..."
+  local tmpfile
+  tmpfile="$(mktemp)"
+  TG_API_ID="$api_id" TG_API_HASH="$api_hash" TG_PROXY="$tg_proxy" \
+    run_as_root -u "$APP_USER" python3 "${dir}/generate_string_session.py" 2>&1 | tee "$tmpfile" >/dev/null || true
+  local session
+  session="$(grep -v '^Put the following' "$tmpfile" | tail -n1 | tr -d '[:space:]')"
+  rm -f "$tmpfile"
+  if [[ -n "$session" ]]; then
+    ok "TG_USER_SESSION generated"
+    printf "%s" "$session"
+    return 0
+  fi
+  err "Failed to generate TG_USER_SESSION"
+  return 1
+}
 parse_alias_paths() {
   local raw="$1"
   local result=""
@@ -199,39 +228,24 @@ configure_env() {
     cp "$defaults_file" "$existing"
   fi
 
-  local current_api_id="" current_api_hash="" current_bot_token="" current_session="" current_proxy=""
-  local current_output_dir="" current_comments="true" current_limit="100" current_workers="5"
-  local current_alias_paths="" current_default_alias="" current_silent="false"
+  local current_api_id="" current_api_hash="" current_bot_token="" current_session="" current_proxy="" current_workers="5"
   if [[ -f "$existing" ]]; then
     current_api_id="$(grep '^TG_API_ID=' "$existing" | cut -d= -f2- || true)"
     current_api_hash="$(grep '^TG_API_HASH=' "$existing" | cut -d= -f2- || true)"
     current_bot_token="$(grep '^TG_BOT_TOKEN=' "$existing" | cut -d= -f2- || true)"
     current_session="$(grep '^TG_USER_SESSION=' "$existing" | cut -d= -f2- || true)"
     current_proxy="$(grep '^TG_PROXY=' "$existing" | cut -d= -f2- || true)"
-    current_output_dir="$(grep '^OUTPUT_DIR=' "$existing" | cut -d= -f2- || true)"
-    current_comments="$(grep '^INCLUDE_COMMENTS=' "$existing" | cut -d= -f2- || true)"
-    current_limit="$(grep '^DEFAULT_CHANNEL_LIMIT=' "$existing" | cut -d= -f2- || true)"
     current_workers="$(grep '^MAX_DOWNLOAD_WORKERS=' "$existing" | cut -d= -f2- || true)"
-    current_alias_paths="$(grep '^DOWNLOAD_DIR_ALIASES=' "$existing" | cut -d= -f2- || true)"
-    current_default_alias="$(grep '^DEFAULT_DOWNLOAD_ALIAS=' "$existing" | cut -d= -f2- || true)"
-    current_silent="$(grep '^SILENT_DOWNLOAD_MODE=' "$existing" | cut -d= -f2- || true)"
   fi
 
   log "Configure bot environment."
-  local api_id api_hash bot_token user_session tg_proxy output_dir include_comments default_limit max_workers alias_paths default_alias silent_mode
+  local api_id api_hash bot_token user_session tg_proxy max_workers
   api_id="$(prompt_default 'TG_API_ID' "$current_api_id")"
   api_hash="$(prompt_default 'TG_API_HASH' "$current_api_hash" true)"
   bot_token="$(prompt_default 'TG_BOT_TOKEN' "$current_bot_token" true)"
-  user_session="$(prompt_default 'TG_USER_SESSION' "$current_session" true)"
   tg_proxy="$(prompt_default 'TG_PROXY (optional)' "$current_proxy")"
-  output_dir="$(prompt_default 'OUTPUT_DIR (absolute path recommended on Linux)' "${current_output_dir:-${dir}/downloads}")"
-  include_comments="$(prompt_default 'INCLUDE_COMMENTS (true/false)' "$current_comments")"
-  default_limit="$(prompt_default 'DEFAULT_CHANNEL_LIMIT' "$current_limit")"
+  user_session="$(generate_user_session "$dir" "$api_id" "$api_hash" "$tg_proxy")"
   max_workers="$(prompt_default 'MAX_DOWNLOAD_WORKERS (1-10)' "$current_workers")"
-  alias_paths="$(prompt_default 'DOWNLOAD_DIR_ALIASES (alias=/abs/path;alias2=/abs/path2)' "$current_alias_paths")"
-  alias_paths="$(parse_alias_paths "$alias_paths")"
-  default_alias="$(prompt_default 'DEFAULT_DOWNLOAD_ALIAS' "$current_default_alias")"
-  silent_mode="$(prompt_default 'SILENT_DOWNLOAD_MODE (true/false)' "$current_silent")"
 
   cat > "$existing" <<EOF
 TG_API_ID=${api_id}
@@ -239,13 +253,7 @@ TG_API_HASH=${api_hash}
 TG_BOT_TOKEN=${bot_token}
 TG_USER_SESSION=${user_session}
 TG_PROXY=${tg_proxy}
-OUTPUT_DIR=${output_dir}
-INCLUDE_COMMENTS=${include_comments}
-DEFAULT_CHANNEL_LIMIT=${default_limit}
 MAX_DOWNLOAD_WORKERS=${max_workers}
-DOWNLOAD_DIR_ALIASES=${alias_paths}
-DEFAULT_DOWNLOAD_ALIAS=${default_alias}
-SILENT_DOWNLOAD_MODE=${silent_mode}
 EOF
   ok ".env updated: ${existing}"
 }

@@ -53,6 +53,41 @@ def parse_download_dir_aliases(raw: str) -> dict[str, str]:
     return aliases
 
 
+def get_env_path() -> Path:
+    return Path(__file__).parent / ".env"
+
+def set_env_var(key: str, value: str) -> None:
+    env_path = get_env_path()
+    lines_env = []
+    found = False
+    if env_path.exists():
+        lines_env = env_path.read_text(encoding="utf-8").splitlines()
+    new_lines_out = []
+    for line in lines_env:
+        if line.startswith(key + "="):
+            new_lines_out.append(key + "=" + value)
+            found = True
+        else:
+            new_lines_out.append(line)
+    if not found:
+        new_lines_out.append(key + "=" + value)
+    env_path.write_text("\n".join(new_lines_out) + "\n", encoding="utf-8")
+
+def get_env_var(key: str, default: str = "") -> str:
+    env_path = get_env_path()
+    if not env_path.exists():
+        return default
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1]
+    return default
+
+def restart_service() -> None:
+    import subprocess
+    subprocess.run(["systemctl", "restart", "tg-download-bot"], check=False)
+    print("Service restart triggered.")
+
+
 def build_download_dir_buttons(alias_map: dict[str, str]) -> list[list[Button]]:
     rows: list[list[Button]] = []
     row: list[Button] = []
@@ -75,6 +110,9 @@ async def sync_bot_commands(bot_client: TelegramClient) -> None:
                 types.BotCommand(command="start", description="显示帮助"),
                 types.BotCommand(command="message", description="下载消息或评论链接"),
                 types.BotCommand(command="channel", description="下载频道消息"),
+                types.BotCommand(command="dir", description="下载目录管理"),
+                types.BotCommand(command="silent", description="静默下载模式"),
+                types.BotCommand(command="default", description="设置默认目录"),
                 types.BotCommand(command="pause", description="暂停当前任务"),
                 types.BotCommand(command="resume", description="恢复当前任务"),
                 types.BotCommand(command="stop", description="停止当前任务"),
@@ -293,18 +331,136 @@ async def main() -> None:
     async def handle_start(event):
         await event.reply(
             "命令：\n"
-            "/channel <channel_link> [count]\n"
-            "/message <message_link_or_comment_link>\n"
-            "/pause\n"
-            "/resume\n"
-            "/stop\n"
+            "/channel <频道链接> [数量]\n"
+            "/message <消息链接或评论链接>\n"
+            "/dir add|del|list - 管理下载目录\n"
+            "/default <别名> - 设置静默模式默认目录\n"
+            "/silent on|off - 开关静默模式\n"
+            "/pause - 暂停任务\n"
+            "/resume - 恢复任务\n"
+            "/stop - 停止任务\n"
+            "\n"
             "主贴链接会下载主消息加评论区资源。\n"
             "评论链接会下载主消息加指定评论资源组。\n"
             "如果 /channel 不带数量，会弹出 full / 200 / 100 / 50 按钮供你选择。\n"
             "你也可以直接把频道消息转发给我，我会尝试抓原消息和评论区资源。"
         )
 
-    @bot_client.on(events.NewMessage(pattern=r"^/pause$"))
+
+    @bot_client.on(events.NewMessage(pattern=r"^/dir(?:\s+(.*))?$"))
+    async def handle_dir(event):
+        raw = event.pattern_match.group(1) or ""
+        parts = raw.strip().split(maxsplit=1)
+        op = parts[0] if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        aliases_raw = get_env_var("DOWNLOAD_DIR_ALIASES", "")
+        aliases = parse_download_dir_aliases(aliases_raw)
+
+        if op == "":
+            if not aliases:
+                await event.reply("当前未设置任何下载目录别名。用法：\n/dir add <别名> <绝对路径>\n/dir del <别名>\n/dir list")
+                return
+            msg_lines = ["当前下载目录别名："]
+            for name, path_alias in aliases.items():
+                msg_lines.append("  " + name + " -> " + path_alias)
+            msg_lines.append("")
+            msg_lines.append("用法：\n/dir add <别名> <绝对路径>\n/dir del <别名>\n/dir list")
+            await event.reply("\n".join(msg_lines))
+            return
+
+        if op == "list":
+            if not aliases:
+                await event.reply("暂无别名")
+                return
+            msg_lines = ["别名列表："]
+            for name, path_alias in aliases.items():
+                msg_lines.append("  " + name + " -> " + path_alias)
+            await event.reply("\n".join(msg_lines))
+            return
+
+        if op == "add":
+            if " " not in rest or not rest.strip():
+                await event.reply("用法：/dir add <别名> <绝对路径>\n示例：/dir add disk1 /mnt/disk1/downloads")
+                return
+            alias_name, alias_path = rest.split(" ", 1)
+            alias_name = alias_name.strip()
+            alias_path = alias_path.strip()
+            if not alias_name or not alias_path:
+                await event.reply("别名和路径都不能为空")
+                return
+            if not alias_path.startswith("/"):
+                await event.reply("路径必须是绝对路径（以 / 开头）")
+                return
+            old = aliases.get(alias_name, "")
+            aliases[alias_name] = alias_path
+            combined = ";".join(k + "=" + v for k, v in aliases.items())
+            set_env_var("DOWNLOAD_DIR_ALIASES", combined)
+            restart_service()
+            action = "已更新别名 " if old else "已添加别名 "
+            await event.reply(action + alias_name + " -> " + alias_path + "\n服务重启中...")
+            return
+
+        if op == "del":
+            name = rest.strip()
+            if not name:
+                await event.reply("用法：/dir del <别名>")
+                return
+            if name not in aliases:
+                await event.reply("别名 " + name + " 不存在")
+                return
+            del aliases[name]
+            combined = ";".join(k + "=" + v for k, v in aliases.items()) if aliases else ""
+            set_env_var("DOWNLOAD_DIR_ALIASES", combined)
+            current_default = get_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
+            if current_default == name:
+                set_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
+            restart_service()
+            await event.reply("已删除别名 " + name + "\n服务重启中...")
+            return
+
+        await event.reply("未知操作，可用：/dir add | del | list")
+
+    @bot_client.on(events.NewMessage(pattern=r"^/silent(?:\s+(on|off))?$"))
+    async def handle_silent(event):
+        raw = event.pattern_match.group(1) or ""
+        current = get_env_var("SILENT_DOWNLOAD_MODE", "false")
+        if not raw:
+            status = "开启" if current == "true" else "关闭"
+            await event.reply("静默模式当前为：" + status + "\n切换：/silent on | /silent off")
+            return
+        if raw not in ("on", "off"):
+            await event.reply("用法：/silent on | /silent off")
+            return
+        new_val = "true" if raw == "on" else "false"
+        set_env_var("SILENT_DOWNLOAD_MODE", new_val)
+        restart_service()
+        mode_str = "开启" if raw == "on" else "关闭"
+        await event.reply("静默模式已" + mode_str + "，服务重启中...")
+
+    @bot_client.on(events.NewMessage(pattern=r"^/default(?:\s+(.*))?$"))
+    async def handle_default(event):
+        raw = event.pattern_match.group(1) or ""
+        aliases_raw = get_env_var("DOWNLOAD_DIR_ALIASES", "")
+        aliases = parse_download_dir_aliases(aliases_raw)
+        current = get_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
+
+        if not raw.strip():
+            if current and current in aliases:
+                await event.reply("当前默认目录：" + current + " -> " + aliases[current] + "\n设置：/default <别名>")
+            else:
+                await event.reply("当前未设置默认目录\n设置：/default <别名>")
+            return
+
+        name = raw.strip()
+        if name not in aliases:
+            available = ", ".join(aliases.keys()) if aliases else "（无）"
+            await event.reply("别名 " + name + " 不存在，可用别名：" + available)
+            return
+        set_env_var("DEFAULT_DOWNLOAD_ALIAS", name)
+        restart_service()
+        await event.reply("默认目录已设为：" + name + " -> " + aliases[name] + "\n服务重启中...")
+
     async def handle_pause(event):
         control = active_task.get("control")
         if not isinstance(control, TaskControl):
