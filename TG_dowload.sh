@@ -3,7 +3,10 @@ set -euo pipefail
 
 APP_NAME="TG_dowload_bot"
 SERVICE_NAME="tg-download-bot"
-INSTALL_DIR_DEFAULT="/opt/${APP_NAME}"
+APP_USER="${SUDO_USER:-$USER}"
+APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6 2>/dev/null || printf '%s' "$HOME")"
+INSTALL_DIR_DEFAULT="${APP_HOME}/TG_download"
+SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
 REPO_URL_DEFAULT="${TG_DOWNLOAD_BOT_REPO_URL:-https://github.com/REPLACE_ME/TG_dowload_bot.git}"
 
 RED="\033[31m"
@@ -48,7 +51,7 @@ app_user() {
   if [[ -f "/etc/${SERVICE_NAME}.conf" ]]; then
     grep '^APP_USER=' "/etc/${SERVICE_NAME}.conf" | head -n1 | cut -d= -f2-
   else
-    printf "%s" "${SUDO_USER:-$USER}"
+    printf "%s" "$APP_USER"
   fi
 }
 
@@ -56,7 +59,7 @@ app_group() {
   if [[ -f "/etc/${SERVICE_NAME}.conf" ]]; then
     grep '^APP_GROUP=' "/etc/${SERVICE_NAME}.conf" | head -n1 | cut -d= -f2-
   else
-    id -gn "${SUDO_USER:-$USER}"
+    id -gn "$APP_USER"
   fi
 }
 
@@ -155,6 +158,16 @@ EOF
   run_as_root systemctl daemon-reload
 }
 
+install_command_entry() {
+  local dir="$1"
+  run_as_root tee "$SCRIPT_INSTALL_PATH" >/dev/null <<EOF
+#!/usr/bin/env bash
+cd "${dir}"
+exec "${dir}/TG_dowload.sh" "\$@"
+EOF
+  run_as_root chmod +x "$SCRIPT_INSTALL_PATH"
+}
+
 ensure_owner() {
   local dir="$1"
   local user="$2"
@@ -234,10 +247,10 @@ install_app() {
   ensure_packages
 
   local target_dir target_user target_group repo_url
+  target_user="$APP_USER"
+  target_group="$(id -gn "$target_user")"
   target_dir="$(prompt_default 'Install directory' "$INSTALL_DIR_DEFAULT")"
   repo_url="$(prompt_default 'Git repository URL' "$REPO_URL_DEFAULT")"
-  target_user="${SUDO_USER:-$USER}"
-  target_group="$(id -gn "$target_user")"
 
   run_as_root mkdir -p "$target_dir"
   if [[ -d "${target_dir}/.git" ]]; then
@@ -252,8 +265,10 @@ install_app() {
   configure_env "$target_dir"
   ensure_owner "$target_dir" "$target_user" "$target_group"
   write_service_file "$target_dir" "$target_user" "$target_group"
+  install_command_entry "$target_dir"
   run_as_root systemctl enable --now "${SERVICE_NAME}.service"
   ok "Installation complete and service started."
+  ok "You can manage it later with: tgd"
 }
 
 reconfigure_app() {
@@ -294,6 +309,7 @@ uninstall_app() {
     run_as_root rm -f "/etc/${SERVICE_NAME}.conf"
     run_as_root systemctl daemon-reload
   fi
+  run_as_root rm -f "$SCRIPT_INSTALL_PATH"
   run_as_root rm -rf "$dir"
   ok "Uninstalled."
 }

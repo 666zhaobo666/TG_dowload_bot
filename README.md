@@ -122,7 +122,7 @@ downloads/
 
 ## Linux 一键管理
 
-项目附带一个 Linux 管理脚本：[linux_manager.sh](C:/AAA/Projects/TG_download/linux_manager.sh)
+项目附带一个 Linux 管理脚本：[TG_dowload.sh](C:/AAA/Projects/TG_download/TG_dowload.sh)
 
 这个脚本适合通过 `curl` 下载后直接执行，支持：
 
@@ -142,16 +142,25 @@ downloads/
 下载并执行：
 
 ```bash
-curl -fsSL <RAW_SCRIPT_URL> -o linux_manager.sh
-chmod +x linux_manager.sh
-./linux_manager.sh
+mkdir -p ~/TG_download
+cd ~/TG_download
+curl -fsSL <RAW_SCRIPT_URL> -o TG_dowload.sh
+chmod +x TG_dowload.sh
+./TG_dowload.sh
 ```
 
 安装完成后：
 
-- 默认安装到 `/opt/TG_dowload_bot`
+- 默认安装到 `~/TG_download`
 - 默认服务名：`tg-download-bot.service`
 - 安装完成后会自动启动服务
+- 会安装一个全局管理命令：`tgd`
+
+后续你可以直接运行：
+
+```bash
+tgd
+```
 
 ### systemd 服务管理
 
