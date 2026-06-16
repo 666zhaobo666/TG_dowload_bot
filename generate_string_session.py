@@ -13,6 +13,7 @@
 注意：
 - 启用 telethon logging（WARNING 级别），方便排查「session 已存在 / 数据库被锁 / IP 风控」等问题。
 - 不在工作目录下创建任何 .session 文件，避免污染安装目录。
+- 主动设置较短 connect 超时（默认 10s / 重试 2 次），避免在不可达的网络下卡住几分钟。
 """
 
 from __future__ import annotations
@@ -30,6 +31,11 @@ from telethon.sessions import StringSession
 
 from proxy_config import get_proxy_from_env
 
+# 短超时配置：从默认的 5 次重试降到 2 次，单次连接 timeout 设短。
+# 国内直连 telegram.org 几乎必然超时，缩短它能让「没配代理」的错误信息更快冒出来。
+_CONNECT_TIMEOUT_S = float(os.environ.get("TG_CONNECT_TIMEOUT", "10"))
+_RETRY_COUNT = int(os.environ.get("TG_CONNECT_RETRY", "2"))
+
 
 def _setup_logging() -> None:
     logging.basicConfig(
@@ -40,7 +46,15 @@ def _setup_logging() -> None:
 
 def _prompt_phone(default: str | None) -> str:
     suffix = f" [{default}]" if default else ""
-    raw = input(f"Please enter your phone (international format, e.g. +8613800138000){suffix}: ").strip()
+    sys.stderr.write(
+        f"Please enter your phone (international format, e.g. +8613800138000){suffix}: "
+    )
+    sys.stderr.flush()
+    raw = sys.stdin.readline()
+    if not raw:
+        print("Phone number is required (stdin closed).", file=sys.stderr)
+        sys.exit(2)
+    raw = raw.strip()
     if not raw and default:
         return default
     if not raw:
@@ -50,15 +64,32 @@ def _prompt_phone(default: str | None) -> str:
 
 
 def _code_callback() -> str:
-    return input("Please enter the code you received: ").strip()
+    sys.stderr.write("Please enter the code you received: ")
+    sys.stderr.flush()
+    raw = sys.stdin.readline()
+    if not raw:
+        raise KeyboardInterrupt("stdin closed")
+    return raw.strip()
 
 
 def _password_callback() -> str:
-    return getpass.getpass("Please enter your 2FA password: ")
+    sys.stderr.write("Please enter your 2FA password: ")
+    sys.stderr.flush()
+    raw = sys.stdin.readline()
+    if not raw:
+        raise KeyboardInterrupt("stdin closed")
+    return raw.strip()
 
 
 async def _run(api_id: int, api_hash: str, proxy, phone: str | None) -> str:
-    client = TelegramClient(StringSession(), api_id, api_hash, proxy=proxy)
+    client = TelegramClient(
+        StringSession(),
+        api_id,
+        api_hash,
+        proxy=proxy,
+        connection_retries=_RETRY_COUNT,
+        timeout=_CONNECT_TIMEOUT_S,
+    )
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -107,6 +138,14 @@ def main() -> None:
         print(f"Invalid TG_PROXY: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    if proxy is None:
+        print(
+            "[hint] TG_PROXY is not set. If you're on a network that cannot reach "
+            "telegram.org directly (e.g. mainland China without VPN), the connection "
+            "will fail. Set TG_PROXY=socks5://host:port before running.",
+            file=sys.stderr,
+        )
+
     try:
         session_string = asyncio.run(_run(api_id, api_hash, proxy, args.phone))
     except KeyboardInterrupt:
@@ -124,6 +163,13 @@ def main() -> None:
     except errors.FloodWaitError as exc:
         print(f"Flood wait: please retry in {exc.seconds} seconds.", file=sys.stderr)
         sys.exit(5)
+    except ConnectionError as exc:
+        print(
+            f"Cannot reach Telegram servers ({exc}). "
+            "Check your network / TG_PROXY configuration.",
+            file=sys.stderr,
+        )
+        sys.exit(6)
     except errors.RPCError as exc:
         print(f"Telegram RPC error: {exc}", file=sys.stderr)
         sys.exit(6)

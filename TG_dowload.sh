@@ -51,11 +51,68 @@ run_as_root() {
   if [[ -n "$run_user" && "$current_user" == "$run_user" ]]; then
     "$@"
   elif [[ -n "$run_user" ]]; then
-    sudo -u "$run_user" "$@"
+    # -H 设 HOME，避免 sudo 抱怨；不重定向 stdin/stdout，让 sudo 透传 tty
+    sudo -H -u "$run_user" "$@"
   elif [[ "$(id -u)" -ne 0 ]]; then
     sudo "$@"
   else
     "$@"
+  fi
+}
+
+# 探测「当前用户 sudo -H -u $target_user 是否能用」。
+# 返回 0 = OK，非 0 = 不能用（requiretty / 缺 NOPASSWD 等）。
+_probe_sudo_target_user() {
+  local target_user="$1"
+  local current_user
+  current_user="$(id -un 2>/dev/null || echo root)"
+  if [[ "$current_user" == "$target_user" ]]; then
+    return 0
+  fi
+  # 用 sudo -n -H -u $target_user true：-n 防止 sudo 试图读密码
+  if sudo -n -H -u "$target_user" true </dev/null >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# 在 install 流程里探测 sudo 配置并给出明确指引。
+_check_sudo_for_target_user() {
+  local target_user="$1"
+  local current_user
+  current_user="$(id -un 2>/dev/null || echo root)"
+  if [[ "$current_user" == "$target_user" ]]; then
+    return 0
+  fi
+  if _probe_sudo_target_user "$target_user"; then
+    log "sudo 权限检测通过：可切换到 $target_user。"
+    return 0
+  fi
+
+  warn "无法用 sudo 切换到 $target_user（可能 requiretty / 缺 NOPASSWD 规则）。"
+  cat <<EOF >&2
+后续管理脚本会用 sudo 把命令切换到 $target_user 用户执行（例如生成
+TG_USER_SESSION）。如果 sudo 拒绝，生成 session 等交互流程会失败。
+
+修复方法（任选其一）：
+  1. 把当前用户加入 $target_user 组并配置 NOPASSWD：
+     sudo visudo
+     添加：$current_user ALL=($target_user) NOPASSWD: ALL
+
+  2. 关闭 requiretty（如果 /etc/sudoers 里有的话）：
+     sudo visudo
+     注释掉：Defaults requiretty
+
+  3. 直接以 $target_user 用户运行管理脚本（不要用 sudo ./）：
+     su - $target_user -c 'curl ... | bash'
+
+继续安装？[y/N]:
+EOF
+  local ans
+  read -r ans
+  if [[ "${ans,,}" != "y" ]]; then
+    err "已取消。"
+    exit 1
   fi
 }
 
@@ -159,9 +216,15 @@ _normalize_session_value() {
 
 # 调起 generate_string_session.py 交互式生成 TG_USER_SESSION。
 # 通过 --output 让 python 把 session 写入文件，避免从 stdout 里 grep/tail 解析出错。
-# 如果 python 退出码非 0，会把 stderr 输出原样转给用户。
-# 重要：本函数的所有提示信息（log/ok/err）走 stderr，只有 session 字符串走 stdout，
-# 这样调用方 \$(generate_user_session ...) 不会把装饰信息当成 session 内容。
+#
+# stdin/stdout/stderr **不重定向**，直接连到当前 tty：
+#   - python 的 prompt（手机号 / 验证码 / 2FA 密码）能直接显示给用户
+#   - 用户的键盘输入能直接到达 python
+#   - python 报错（连不上 / 风控 / 错误码）能直接显示
+# 这样依赖 sudo -u 能正常透传 stdin/stdout（无 requiretty 时 OK）。
+#
+# 如果 sudo 因为 requiretty 失败，python 根本不会启动 —— 我们通过超时 + 检测
+# session 文件是否被写入来识别这种情况并给用户明确提示。
 generate_user_session() {
   local dir="$1"
   local api_id="$2"
@@ -169,15 +232,12 @@ generate_user_session() {
   local tg_proxy="${4:-}"
   local phone="${5:-}"
 
-  # 局部 override log/ok，把它们在本函数内的输出重定向到 stderr，
-  # 这样调用方 $(generate_user_session ...) 拿到的就是干净的 session 字符串。
+  # 局部 override log/ok，让它们在本函数内输出到 stderr（不污染 stdout 捕获）
   local _log_save _ok_save
   _log_save="$(declare -f log)"
   _ok_save="$(declare -f ok)"
   eval "log() { printf '%b[%s]%b %s\n' \"\$BLUE\" \"\$APP_NAME\" \"\$RESET\" \"\$*\" >&2; }"
   eval "ok() { printf '%b[%s]%b %s\n' \"\$GREEN\" \"\$APP_NAME\" \"\$RESET\" \"\$*\" >&2; }"
-
-  # 函数退出时（无论成功失败）恢复原始 log/ok
   trap 'eval "$_log_save"; eval "$_ok_save"; trap - RETURN' RETURN
 
   if [[ -z "$api_id" || -z "$api_hash" ]]; then
@@ -185,10 +245,8 @@ generate_user_session() {
     return 1
   fi
 
-  local out_file err_file
+  local out_file
   out_file="$(mktemp)"
-  err_file="$(mktemp)"
-  # 600 权限，避免 session 字符串被同机其他用户读到
   chmod 600 "$out_file"
 
   log "正在生成 TG_USER_SESSION，接下来会提示输入手机号和验证码。"
@@ -196,6 +254,8 @@ generate_user_session() {
     log "（已记录手机号 $phone；脚本仍会要求你输入 Telegram 验证码 / 2FA 密码）"
   fi
 
+  # 关键：不重定向 stdin/stdout/stderr，让 python 直接和用户交互。
+  # session 通过 --output 传递，stderr/stdout 上是 python 的交互 prompt + 日志。
   local exit_code=0
   TG_API_ID="$api_id" \
   TG_API_HASH="$api_hash" \
@@ -203,35 +263,44 @@ generate_user_session() {
   TG_PHONE="$phone" \
     run_as_root -u "$APP_USER" "${dir}/.venv/bin/python" "${dir}/generate_string_session.py" \
       --output "$out_file" \
-    > /dev/null 2> "$err_file" || exit_code=$?
+    || exit_code=$?
+
+  # 函数结束：把 log/ok 恢复回去（在 trap RETURN 里已经做了，但 trap 只在
+  # 函数 return 时触发；这里我们手动恢复一次以防 trap 没注册成功）
+  eval "$_log_save" >/dev/null 2>&1 || true
+  eval "$_ok_save" >/dev/null 2>&1 || true
 
   if [[ "$exit_code" -ne 0 ]]; then
-    err "TG_USER_SESSION 生成失败（python 退出码 $exit_code）。错误信息："
-    sed 's/^/  /' "$err_file" >&2
-    rm -f "$out_file" "$err_file"
+    err "TG_USER_SESSION 生成失败（python 退出码 $exit_code）。"
     cat <<EOF >&2
 常见原因：
+  - sudo 配置不允许无密码切换到 $APP_USER（需要 requiretty / 缺免密规则）。
+    解决：sudo visudo 添加一行
+      $APP_USER ALL=(ALL) NOPASSWD: ALL
+    或者把当前用户加入 sudo 组并启用 NOPASSWD。
+  - 网络问题或代理不可达：请检查 TG_PROXY 配置；telethon 默认 2 次重试 × 10s。
   - 手机号格式不对（需要国际格式，例如 +8613800138000）。
   - Telegram 风控：同一时间同一账号最多 10 个活跃 session。
     请到 Telegram 客户端 → Settings → Devices → Terminate Other Sessions
     关掉不用的设备后再试。
-  - 网络问题或代理不可达：请检查 TG_PROXY 配置。
 EOF
+    rm -f "$out_file"
     return 1
   fi
 
   if [[ ! -s "$out_file" ]]; then
     err "TG_USER_SESSION 生成失败：python 没有写入 session 文件。"
-    if [[ -s "$err_file" ]]; then
-      sed 's/^/  /' "$err_file" >&2
-    fi
-    rm -f "$out_file" "$err_file"
+    cat <<EOF >&2
+可能原因：python 提前退出而没有把 session 写入文件。
+请检查上面的 python 输出（手机号 / 验证码 / 网络错误等）。
+EOF
+    rm -f "$out_file"
     return 1
   fi
 
   local session
   session="$(tr -d '[:space:]' < "$out_file")"
-  rm -f "$out_file" "$err_file"
+  rm -f "$out_file"
 
   if [[ -z "$session" ]]; then
     err "TG_USER_SESSION 生成失败：session 文件为空。"
@@ -442,6 +511,11 @@ configure_env() {
   echo ""
   bot_token_val="$(prompt_default '请输入 TG Bot Token' "$cur_bot_token" true)"
   echo ""
+  # 代理地址：用户首次填时给个明确提示，避免国内直连卡住
+  if [[ -z "$cur_proxy" ]]; then
+    warn "如果机器不在中国大陆，且能直连 telegram.org，可以直接回车跳过代理。"
+    warn "否则请填写 socks5/http 代理地址，例如 socks5://127.0.0.1:10808"
+  fi
   proxy_val="$(prompt_default '请输入 TG 代理地址（可选）' "$cur_proxy")"
   echo ""
   workers_val="$(prompt_default '请输入最大下载并发数（1-10）' "$cur_workers")"
@@ -689,6 +763,9 @@ install_app() {
   local target_dir target_user target_group repo_url
   target_user="$APP_USER"
   target_group="$(id -gn "$target_user")"
+
+  # 探测 sudo 配置：后续脚本会用 sudo 切换到 $target_user 执行敏感命令
+  _check_sudo_for_target_user "$target_user"
   target_dir="$(prompt_default '安装目录' "$INSTALL_DIR_DEFAULT")"
   target_dir="$(normalize_linux_path "$target_dir")"
   repo_url="$REPO_URL_DEFAULT"
