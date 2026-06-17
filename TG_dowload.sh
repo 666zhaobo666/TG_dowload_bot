@@ -10,7 +10,10 @@ if [[ "$(id -u)" -eq 0 && "$APP_HOME" == /root* ]]; then
   INSTALL_DIR_DEFAULT="/opt/TG_download"
 fi
 SCRIPT_INSTALL_PATH="/usr/local/bin/tgd"
-REPO_URL_DEFAULT="https://proxy.cccg.top/github.com/666zhaobo666/TG_dowload_bot.git"
+REPO_URL_OFFICIAL="https://github.com/666zhaobo666/TG_dowload_bot.git"
+# 允许通过 TG_REPO_URL 环境变量覆盖默认 clone 源（例如内网镜像 / 私有 fork）。
+# clone 失败时会自动回退到 GitHub 官方源，避免加速域名临时不可用导致安装卡死。
+REPO_URL_DEFAULT="${TG_REPO_URL:-https://proxy.cccg.top/github.com/666zhaobo666/TG_dowload_bot.git}"
 
 # 历史上 .env.example 里 TG_USER_SESSION 用过的占位符。
 # 用于把旧部署里的「假 session」识别为「未配置」。
@@ -117,7 +120,8 @@ EOF
 }
 
 service_exists() {
-  systemctl list-unit-files | grep -q "^${SERVICE_NAME}\.service"
+  # 用 systemctl cat 精确判定 unit 是否存在，避免依赖 list-unit-files 的输出格式与 grep。
+  systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1
 }
 
 install_dir() {
@@ -198,6 +202,17 @@ normalize_linux_path() {
   if [[ "$path" != "/" ]]; then
     path="${path%/}"
   fi
+
+  # 拦截危险路径：误把系统目录当安装目录会在后续 git clone 前 rm -rf 整个目录，
+  # 造成灾难性删除。这里精确匹配系统/根目录本身；子目录（如 /opt/TG_download）放行。
+  local _danger
+  for _danger in / /bin /boot /dev /etc /lib /lib64 /proc /root /run /sbin /srv /sys /usr /var /home /opt /mnt /media /tmp; do
+    if [[ "$path" == "$_danger" ]]; then
+      err "拒绝使用系统/危险目录作为安装目录：$path"
+      err "请指定一个专用子目录，例如 /opt/TG_download 或 /home/<user>/TG_download。"
+      exit 1
+    fi
+  done
 
   printf "%s" "$path"
 }
@@ -755,6 +770,23 @@ _strip_env_placeholders() {
   run_as_root chmod 600 "$existing"
 }
 
+# clone 仓库，失败时回退到 GitHub 官方源，避免加速域名临时不可用导致安装卡死。
+# 优先用传入的 url（默认加速镜像 / TG_REPO_URL 覆盖值）；失败且非官方源时回退。
+clone_repo() {
+  local url="$1"
+  local dest="$2"
+  local user="$3"
+  if run_as_root -u "$user" git clone "$url" "$dest"; then
+    return 0
+  fi
+  if [[ "$url" != "$REPO_URL_OFFICIAL" ]]; then
+    warn "克隆失败（$url），回退到 GitHub 官方源重试..."
+    run_as_root -u "$user" git clone "$REPO_URL_OFFICIAL" "$dest"
+    return $?
+  fi
+  return 1
+}
+
 install_app() {
   require_linux
   ensure_packages
@@ -777,8 +809,11 @@ install_app() {
   if [[ -d "${target_dir}/.git" ]]; then
     run_as_root -u "$target_user" git -C "$target_dir" pull --ff-only
   else
-    run_as_root rm -rf "$target_dir"
-    run_as_root -u "$target_user" git clone "$repo_url" "$target_dir"
+    # rm -rf 前已有 normalize_linux_path 拦截系统/危险目录；这里再做一次存在性确认。
+    if [[ -e "$target_dir" ]]; then
+      run_as_root rm -rf "$target_dir"
+    fi
+    clone_repo "$repo_url" "$target_dir" "$target_user"
   fi
 
   write_service_conf "$target_dir" "$target_user" "$target_group"
