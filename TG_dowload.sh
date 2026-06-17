@@ -1118,6 +1118,89 @@ EOF
   echo "      如需清除，请到 Telegram 客户端 → Settings → Devices → Terminate Other Sessions。"
 }
 
+# 更新：停止服务 → 拉取最新代码（保留 .env / session / downloads / .venv）→ 重装依赖 → 重启服务。
+# 用户配置（.env、*.session、downloads/）都是 git 忽略/未跟踪文件，git 操作不会动它们；
+# .venv 也属未跟踪，仅重装依赖不重建，更新更快。
+update_app() {
+  require_linux
+  is_installed || { err "未检测到已安装的 ${APP_NAME}，请先安装。"; exit 1; }
+
+  local dir user group
+  dir="$(install_dir)"
+  user="$(app_user)"
+  group="$(app_group)"
+
+  [[ -n "$dir" && -d "$dir" ]] || { err "无法确定安装目录：${dir:-（空）}"; exit 1; }
+  [[ -d "${dir}/.git" ]] || { err "安装目录不是一个 git 仓库（$dir），无法通过 git 更新。"; exit 1; }
+
+  echo ""
+  log "更新 ${APP_NAME}"
+  log "安装目录：$dir"
+  log "将保留的用户数据："
+  log "  - .env（TG_API_ID / TG_API_HASH / TG_BOT_TOKEN / TG_USER_SESSION / 代理 等）"
+  log "  - *.session / *.session-journal（登录会话）"
+  log "  - downloads/（已下载的归档数据）"
+  log "  - .venv/（虚拟环境，仅重装依赖不重建）"
+  warn "注意：本地对已跟踪文件（如 *.py / *.sh）的手工修改将被丢弃，以远程最新代码为准。"
+
+  # 1) 停止服务，避免更新期间 bot 进程占用文件。
+  log "停止服务..."
+  run_as_root systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+
+  # 2) 拉取最新代码：先尝试快进合并（非破坏性）；失败则提示后强制重置到远程分支。
+  local branch
+  branch="$(run_as_root -u "$user" git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  log "拉取最新代码（当前分支：${branch:-unknown}）..."
+  run_as_root -u "$user" git -C "$dir" fetch origin --prune || { err "git fetch 失败，请检查网络或仓库地址。"; exit 1; }
+
+  if run_as_root -u "$user" git -C "$dir" pull --ff-only 2>/dev/null; then
+    ok "代码已更新（快进合并）。"
+  else
+    warn "快进合并失败（可能有本地修改或分支分叉）。"
+    if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+      err "无法确定当前分支（HEAD 处于分离状态），请手动处理：cd $dir && git status"
+      log "重新启动服务..."
+      run_as_root systemctl start "${SERVICE_NAME}.service" 2>/dev/null || true
+      exit 1
+    fi
+    read -r -p "是否强制以远程最新代码覆盖本地（保留 .env/session/downloads）？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      run_as_root -u "$user" git -C "$dir" reset --hard "origin/${branch}" || { err "git reset 失败。"; exit 1; }
+      ok "已强制重置到 origin/${branch}。"
+    else
+      err "已取消更新。代码未改动。"
+      log "重新启动服务..."
+      run_as_root systemctl start "${SERVICE_NAME}.service" 2>/dev/null || true
+      exit 1
+    fi
+  fi
+
+  # 3) 重装依赖到现有 venv（requirements.txt 若有变化则生效）。venv 不存在则重建。
+  local venv_python="${dir}/.venv/bin/python"
+  if [[ -x "$venv_python" ]]; then
+    log "检查 / 重装依赖..."
+    run_as_root -u "$user" "$venv_python" -m pip install -r "${dir}/requirements.txt" >/dev/null 2>&1 \
+      || warn "依赖重装出现警告（通常不影响运行，可查看日志确认）。"
+  else
+    warn "未找到虚拟环境，重新创建..."
+    setup_venv "$dir" "$user"
+  fi
+
+  # 4) 修正属主与管理脚本可执行位。
+  ensure_owner "$dir" "$user" "$group"
+  ensure_install_script_executable "$dir"
+  install_command_entry "$dir"
+
+  # 5) 重启服务。
+  log "重启服务..."
+  run_as_root systemctl start "${SERVICE_NAME}.service" 2>/dev/null \
+    || run_as_root systemctl restart "${SERVICE_NAME}.service" 2>/dev/null || true
+
+  echo ""
+  ok "更新完成，服务已启动。"
+  run_as_root systemctl status "${SERVICE_NAME}.service" --no-pager 2>/dev/null || true
+}
+
 show_install_menu() {
   echo "1) 安装"
   echo "0) 退出"
@@ -1139,7 +1222,8 @@ show_manage_menu() {
   echo "6) 重启服务"
   echo "7) 停止服务"
   echo "8) 查看服务状态"
-  echo "9) 卸载"
+  echo "9) 更新（拉取最新代码，保留配置）"
+  echo "10) 卸载"
   echo "0) 退出"
   read -r -p "请选择： " choice
 
@@ -1152,7 +1236,8 @@ show_manage_menu() {
     6) restart_service ;;
     7) stop_service ;;
     8) status_service ;;
-    9) uninstall_app ;;
+    9) update_app ;;
+    10) uninstall_app ;;
     0) exit 0 ;;
     *) err "无效选项。"; exit 1 ;;
   esac

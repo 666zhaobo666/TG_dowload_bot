@@ -5,6 +5,7 @@ from time import time
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events, functions, types
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from archiver_core import (
@@ -24,11 +25,23 @@ from proxy_config import get_proxy_from_env
 
 channel_choices: dict[int, dict] = {}
 pending_download_choices: dict[int, dict] = {}
+pending_dir_add: dict[int, float] = {}
 active_task: dict[str, object] = {
     "kind": None,
     "title": None,
     "control": None,
     "last_progress": None,
+    "status_message": None,
+    "progress_builder": None,
+    "started_at": None,
+    "display_task": None,
+}
+
+# 运行时可变配置：/dir、/silent 修改后直接更新这里，无需重启服务。
+CFG: dict = {
+    "download_dir_aliases": {},
+    "default_download_alias": "",
+    "silent_download_mode": False,
 }
 
 
@@ -56,22 +69,31 @@ def parse_download_dir_aliases(raw: str) -> dict[str, str]:
 def get_env_path() -> Path:
     return Path(__file__).parent / ".env"
 
+
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
 def set_env_var(key: str, value: str) -> None:
     env_path = get_env_path()
-    lines_env = []
+    lines_env: list[str] = []
     found = False
     if env_path.exists():
         lines_env = env_path.read_text(encoding="utf-8").splitlines()
-    new_lines_out = []
+    new_lines_out: list[str] = []
     for line in lines_env:
         if line.startswith(key + "="):
-            new_lines_out.append(key + "=" + value)
+            # 用单引号包裹，避免路径中含空格 / # / = 等字符被解析器误读。
+            new_lines_out.append(key + "='" + value + "'")
             found = True
         else:
             new_lines_out.append(line)
     if not found:
-        new_lines_out.append(key + "=" + value)
+        new_lines_out.append(key + "='" + value + "'")
     env_path.write_text("\n".join(new_lines_out) + "\n", encoding="utf-8")
+
 
 def get_env_var(key: str, default: str = "") -> str:
     env_path = get_env_path()
@@ -79,13 +101,19 @@ def get_env_var(key: str, default: str = "") -> str:
         return default
     for line in env_path.read_text(encoding="utf-8").splitlines():
         if line.startswith(key + "="):
-            return line.split("=", 1)[1]
+            return _strip_quotes(line.split("=", 1)[1])
     return default
 
-def restart_service() -> None:
-    import subprocess
-    subprocess.run(["systemctl", "restart", "tg-download-bot"], check=False)
-    print("Service restart triggered.")
+
+def reload_dir_config() -> None:
+    """从 .env 重新读取下载目录相关配置到 CFG（修改后即时生效，无需重启服务）。"""
+    CFG["download_dir_aliases"] = parse_download_dir_aliases(
+        get_env_var("DOWNLOAD_DIR_ALIASES", "")
+    )
+    CFG["default_download_alias"] = get_env_var("DEFAULT_DOWNLOAD_ALIAS", "").strip()
+    CFG["silent_download_mode"] = (
+        get_env_var("SILENT_DOWNLOAD_MODE", "false").strip().lower() == "true"
+    )
 
 
 def build_download_dir_buttons(alias_map: dict[str, str]) -> list[list[Button]]:
@@ -101,6 +129,62 @@ def build_download_dir_buttons(alias_map: dict[str, str]) -> list[list[Button]]:
     return rows
 
 
+def build_dir_menu_buttons() -> list[list[Button]]:
+    return [
+        [Button.inline("➕ 添加目录", b"dirm:add"), Button.inline("🗑️ 删除目录", b"dirm:del")],
+        [Button.inline("📋 查看列表", b"dirm:list")],
+    ]
+
+
+def build_dir_del_buttons(aliases: dict[str, str]) -> list[list[Button]]:
+    rows: list[list[Button]] = []
+    row: list[Button] = []
+    for name in aliases:
+        row.append(Button.inline(f"🗑️ {name}", f"dirm:rm:{name}".encode("utf-8")))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([Button.inline("⬅️ 返回", b"dirm:back")])
+    return rows
+
+
+def build_silent_buttons(current_on: bool) -> list[list[Button]]:
+    on_label = "✅ 开启" + ("（当前）" if current_on else "")
+    off_label = "❌ 关闭" + ("（当前）" if not current_on else "")
+    return [[Button.inline(on_label, b"silent:on"), Button.inline(off_label, b"silent:off")]]
+
+
+def build_silent_dir_buttons(aliases: dict[str, str]) -> list[list[Button]]:
+    rows: list[list[Button]] = []
+    row: list[Button] = []
+    for name in aliases:
+        row.append(Button.inline(name, f"sdir:{name}".encode("utf-8")))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([Button.inline("⬅️ 返回", b"silent:back")])
+    return rows
+
+
+def _dir_menu_text(aliases: dict[str, str]) -> str:
+    lines = ["📂 下载目录管理", ""]
+    if not aliases:
+        lines.append("当前未配置任何下载目录。")
+        lines.append("点击「➕ 添加目录」按钮进行添加。")
+    else:
+        lines.append("当前目录：")
+        for name, path_alias in aliases.items():
+            mark = " ⭐" if name == CFG.get("default_download_alias") else ""
+            lines.append(f"  • {name} → {path_alias}{mark}")
+    lines.append("")
+    lines.append("点击下方按钮进行管理：")
+    return "\n".join(lines)
+
+
 async def sync_bot_commands(bot_client: TelegramClient) -> None:
     await bot_client(
         functions.bots.SetBotCommandsRequest(
@@ -112,7 +196,6 @@ async def sync_bot_commands(bot_client: TelegramClient) -> None:
                 types.BotCommand(command="channel", description="下载频道消息"),
                 types.BotCommand(command="dir", description="下载目录管理"),
                 types.BotCommand(command="silent", description="静默下载模式"),
-                types.BotCommand(command="default", description="设置默认目录"),
                 types.BotCommand(command="pause", description="暂停当前任务"),
                 types.BotCommand(command="resume", description="恢复当前任务"),
                 types.BotCommand(command="stop", description="停止当前任务"),
@@ -126,20 +209,80 @@ def current_task_running() -> bool:
     return isinstance(control, TaskControl) and not control.is_stopped
 
 
-def begin_task(kind: str, title: str) -> TaskControl:
+def begin_task(kind: str, title: str, status_message, progress_builder) -> TaskControl:
     control = TaskControl()
     active_task["kind"] = kind
     active_task["title"] = title
     active_task["control"] = control
     active_task["last_progress"] = None
+    active_task["status_message"] = status_message
+    active_task["progress_builder"] = progress_builder
+    active_task["started_at"] = time()
+    old = active_task.get("display_task")
+    if old and not old.done():
+        old.cancel()
+    active_task["display_task"] = asyncio.create_task(_progress_display_loop())
     return control
 
 
 def clear_task() -> None:
+    dt = active_task.get("display_task")
+    if dt and not dt.done():
+        dt.cancel()
     active_task["kind"] = None
     active_task["title"] = None
     active_task["control"] = None
     active_task["last_progress"] = None
+    active_task["status_message"] = None
+    active_task["progress_builder"] = None
+    active_task["started_at"] = None
+    active_task["display_task"] = None
+
+
+async def _progress_display_loop() -> None:
+    """独立于下载的进度刷新循环：把进度编辑与下载解耦，避免高频编辑触发 FloodWait
+    后异常向上传播导致进度刷新中断。频率：开始 1 分钟内 2 秒一次，之后 5 秒一次。
+    """
+    try:
+        last_text: str | None = None
+        while True:
+            started = active_task.get("started_at")
+            if not started:
+                break
+            elapsed = time() - started
+            interval = 2.0 if elapsed < 60.0 else 5.0
+            await asyncio.sleep(interval)
+
+            msg = active_task.get("status_message")
+            builder = active_task.get("progress_builder")
+            info = active_task.get("last_progress")
+            if msg is None or builder is None or info is None:
+                continue
+            try:
+                text = builder(dict(info))
+            except Exception:
+                continue
+
+            now_elapsed = int(time() - (active_task.get("started_at") or time()))
+            control = active_task.get("control")
+            if isinstance(control, TaskControl) and control.is_paused:
+                text += f"\n⏸ 已暂停  ⏱ 已运行 {now_elapsed // 60}m{now_elapsed % 60}s"
+            else:
+                text += f"\n⏱ 已运行 {now_elapsed // 60}m{now_elapsed % 60}s"
+
+            if text == last_text:
+                continue
+            last_text = text
+            try:
+                await msg.edit(text)
+            except FloodWaitError as exc:
+                last_text = None
+                await asyncio.sleep(exc.seconds + 1)
+            except Exception:
+                # 编辑失败（如 MessageNotModifiedError / 网络抖动）绝不能中断下载。
+                pass
+    except asyncio.CancelledError:
+        pass
 
 
 def build_user_client(api_id: int, api_hash: str, session_value: str, proxy) -> TelegramClient:
@@ -194,6 +337,31 @@ def build_live_progress(info: dict) -> str:
     return "\n".join(lines)
 
 
+def build_channel_progress(info: dict) -> str:
+    latest = info.get("title") or f"message {info.get('message_id')}"
+    lines = [
+        "归档中...",
+        f"消息：{info.get('scanned', 0)}/{info.get('target_messages', '?') or 'full'}",
+        f"已扫描：{info.get('scanned', 0)}",
+        f"已归档：{info.get('archived', 0)}",
+        f"已跳过：{info.get('skipped', 0)}",
+        f"失败：{info.get('failed', 0)}",
+        f"主消息文件：{info.get('main_files', 0)}",
+        f"评论文件：{info.get('comment_files', 0)}",
+        f"当前：{latest}",
+    ]
+    event_type = info.get("event")
+    if event_type == "item_progress":
+        lines.append(f"阶段：{info.get('stage', '-')}")
+        if info.get("completed_files") is not None and info.get("total_files") is not None:
+            lines.append(f"文件：{info.get('completed_files', 0)}/{info.get('total_files', 0)}")
+        if info.get("percent") is not None:
+            lines.append(f"进度：{info.get('percent', 0.0):.1f}%")
+        if info.get("speed_bps") is not None:
+            lines.append(f"速度：{info.get('speed_bps', 0.0) / 1024.0:.1f} KB/s")
+    return "\n".join(lines)
+
+
 async def main() -> None:
     load_dotenv()
 
@@ -205,9 +373,7 @@ async def main() -> None:
     include_comments = os.environ.get("INCLUDE_COMMENTS", "true").lower() != "false"
     default_limit = int(os.environ.get("DEFAULT_CHANNEL_LIMIT", "100"))
     max_download_workers = clamp_concurrency(int(os.environ.get("MAX_DOWNLOAD_WORKERS", "1")))
-    download_dir_aliases = parse_download_dir_aliases(os.environ.get("DOWNLOAD_DIR_ALIASES", ""))
-    default_download_alias = os.environ.get("DEFAULT_DOWNLOAD_ALIAS", "").strip()
-    silent_download_mode = os.environ.get("SILENT_DOWNLOAD_MODE", "false").lower() == "true"
+    reload_dir_config()
     proxy = get_proxy_from_env()
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -221,18 +387,19 @@ async def main() -> None:
     await sync_bot_commands(bot_client)
 
     def resolve_output_dir(alias_name: str | None = None) -> Path:
-        if alias_name and alias_name in download_dir_aliases:
-            return Path(download_dir_aliases[alias_name]).resolve()
-        if default_download_alias and default_download_alias in download_dir_aliases:
-            return Path(download_dir_aliases[default_download_alias]).resolve()
+        aliases = CFG["download_dir_aliases"]
+        if alias_name and alias_name in aliases:
+            return Path(aliases[alias_name]).resolve()
+        default_alias = CFG["default_download_alias"]
+        if default_alias and default_alias in aliases:
+            return Path(aliases[default_alias]).resolve()
         return output_root
 
     async def run_message_task(status_message, link: str, output_dir: Path) -> None:
-        task_control = begin_task("message", link.strip())
+        task_control = begin_task("message", link.strip(), status_message, build_live_progress)
         try:
             async def progress(info: dict) -> None:
                 active_task["last_progress"] = dict(info)
-                await status_message.edit(build_live_progress(info))
 
             result = await archive_message_by_link(
                 user_client,
@@ -243,53 +410,24 @@ async def main() -> None:
                 download_options=download_options,
                 task_control=task_control,
             )
+            clear_task()
             if not result:
                 await status_message.edit("这条消息没有可下载的媒体资源。")
-                clear_task()
                 return
             await status_message.edit(result_summary(result))
-            clear_task()
         except ArchiveStoppedError as exc:
+            clear_task()
             await status_message.edit(str(exc))
-            clear_task()
         except Exception as exc:
-            await status_message.edit(f"Archive failed: {type(exc).__name__}: {exc}")
             clear_task()
+            await status_message.edit(f"Archive failed: {type(exc).__name__}: {exc}")
 
     async def run_channel_task(status_message, link: str, limit: int | None, output_dir: Path, label: str) -> None:
-        task_control = begin_task("channel", label)
-
-        async def progress(info: dict) -> None:
-            active_task["last_progress"] = dict(info)
-            event_type = info.get("event")
-            should_update = (
-                event_type in {"failed", "skipped", "item_progress"}
-                or info.get("archived", 0) % 5 == 0 and event_type == "archived"
-            )
-            if should_update:
-                latest = info.get("title") or f"message {info.get('message_id')}"
-                lines = [
-                    "归档中...",
-                    f"消息：{info.get('scanned', 0)}/{info.get('target_messages', '?') or 'full'}",
-                    f"已扫描：{info.get('scanned', 0)}",
-                    f"已归档：{info.get('archived', 0)}",
-                    f"已跳过：{info.get('skipped', 0)}",
-                    f"失败：{info.get('failed', 0)}",
-                    f"主消息文件：{info.get('main_files', 0)}",
-                    f"评论文件：{info.get('comment_files', 0)}",
-                    f"当前：{latest}",
-                ]
-                if event_type == "item_progress":
-                    lines.append(f"阶段：{info.get('stage', '-')}")
-                    if info.get("completed_files") is not None and info.get("total_files") is not None:
-                        lines.append(f"文件：{info.get('completed_files', 0)}/{info.get('total_files', 0)}")
-                    if info.get("percent") is not None:
-                        lines.append(f"进度：{info.get('percent', 0.0):.1f}%")
-                    if info.get("speed_bps") is not None:
-                        lines.append(f"速度：{info.get('speed_bps', 0.0) / 1024.0:.1f} KB/s")
-                await status_message.edit("\n".join(lines))
-
+        task_control = begin_task("channel", label, status_message, build_channel_progress)
         try:
+            async def progress(info: dict) -> None:
+                active_task["last_progress"] = dict(info)
+
             summary = await archive_channel(
                 user_client,
                 link,
@@ -307,6 +445,7 @@ async def main() -> None:
                     for item in summary.failures[:5]
                 )
                 failure_lines = f"\nFailures:\n{failure_preview}"
+            clear_task()
             await status_message.edit(
                 "频道归档完成\n"
                 f"来源：{summary.source_chat}\n"
@@ -319,23 +458,21 @@ async def main() -> None:
                 f"输出目录：{output_dir}"
                 f"{failure_lines}"
             )
-            clear_task()
         except ArchiveStoppedError as exc:
+            clear_task()
             await status_message.edit(str(exc))
-            clear_task()
         except Exception as exc:
-            await status_message.edit(f"Channel archive failed: {type(exc).__name__}: {exc}")
             clear_task()
+            await status_message.edit(f"Channel archive failed: {type(exc).__name__}: {exc}")
 
     @bot_client.on(events.NewMessage(pattern=r"^/start$"))
     async def handle_start(event):
         await event.reply(
             "命令：\n"
-            "/channel <频道链接> [数量]\n"
-            "/message <消息链接或评论链接>\n"
-            "/dir add|del|list - 管理下载目录\n"
-            "/default <别名> - 设置静默模式默认目录\n"
-            "/silent on|off - 开关静默模式\n"
+            "/channel <频道链接> [数量] - 下载频道消息\n"
+            "/message <消息链接或评论链接> - 下载消息\n"
+            "/dir - 下载目录管理（按钮操作）\n"
+            "/silent - 静默下载模式（按钮操作，开启时选择下载目录）\n"
             "/pause - 暂停任务\n"
             "/resume - 恢复任务\n"
             "/stop - 停止任务\n"
@@ -346,7 +483,6 @@ async def main() -> None:
             "你也可以直接把频道消息转发给我，我会尝试抓原消息和评论区资源。"
         )
 
-
     @bot_client.on(events.NewMessage(pattern=r"^/dir(?:\s+(.*))?$"))
     async def handle_dir(event):
         raw = event.pattern_match.group(1) or ""
@@ -354,29 +490,17 @@ async def main() -> None:
         op = parts[0] if parts else ""
         rest = parts[1] if len(parts) > 1 else ""
 
-        aliases_raw = get_env_var("DOWNLOAD_DIR_ALIASES", "")
-        aliases = parse_download_dir_aliases(aliases_raw)
+        reload_dir_config()
+        aliases = CFG["download_dir_aliases"]
 
+        # 无参数：弹出按钮菜单
         if op == "":
-            if not aliases:
-                await event.reply("当前未设置任何下载目录别名。用法：\n/dir add <别名> <绝对路径>\n/dir del <别名>\n/dir list")
-                return
-            msg_lines = ["当前下载目录别名："]
-            for name, path_alias in aliases.items():
-                msg_lines.append("  " + name + " -> " + path_alias)
-            msg_lines.append("")
-            msg_lines.append("用法：\n/dir add <别名> <绝对路径>\n/dir del <别名>\n/dir list")
-            await event.reply("\n".join(msg_lines))
+            await event.reply(_dir_menu_text(aliases), buttons=build_dir_menu_buttons())
             return
 
+        # 文本子命令（按钮的等价快捷方式，同样有反馈）
         if op == "list":
-            if not aliases:
-                await event.reply("暂无别名")
-                return
-            msg_lines = ["别名列表："]
-            for name, path_alias in aliases.items():
-                msg_lines.append("  " + name + " -> " + path_alias)
-            await event.reply("\n".join(msg_lines))
+            await event.reply(_dir_menu_text(aliases))
             return
 
         if op == "add":
@@ -392,13 +516,13 @@ async def main() -> None:
             if not alias_path.startswith("/"):
                 await event.reply("路径必须是绝对路径（以 / 开头）")
                 return
-            old = aliases.get(alias_name, "")
+            existed = alias_name in aliases
             aliases[alias_name] = alias_path
             combined = ";".join(k + "=" + v for k, v in aliases.items())
             set_env_var("DOWNLOAD_DIR_ALIASES", combined)
-            restart_service()
-            action = "已更新别名 " if old else "已添加别名 "
-            await event.reply(action + alias_name + " -> " + alias_path + "\n服务重启中...")
+            reload_dir_config()
+            action = "已更新" if existed else "已添加"
+            await event.reply("✅ " + action + "下载目录：" + alias_name + " -> " + alias_path)
             return
 
         if op == "del":
@@ -412,44 +536,56 @@ async def main() -> None:
             del aliases[name]
             combined = ";".join(k + "=" + v for k, v in aliases.items()) if aliases else ""
             set_env_var("DOWNLOAD_DIR_ALIASES", combined)
-            current_default = get_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
-            if current_default == name:
+            if CFG["default_download_alias"] == name:
                 set_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
-            restart_service()
-            await event.reply("已删除别名 " + name + "\n服务重启中...")
+            reload_dir_config()
+            await event.reply("✅ 已删除下载目录：" + name)
             return
 
         await event.reply("未知操作，可用：/dir add | del | list")
 
-    @bot_client.on(events.NewMessage(pattern=r"^/silent(?:\s+(on|off))?$"))
+    @bot_client.on(events.NewMessage(pattern=r"^/silent(?:\s+(.*))?$"))
     async def handle_silent(event):
-        raw = event.pattern_match.group(1) or ""
-        current = get_env_var("SILENT_DOWNLOAD_MODE", "false")
-        if not raw:
-            status = "开启" if current == "true" else "关闭"
-            await event.reply("静默模式当前为：" + status + "\n切换：/silent on | /silent off")
+        reload_dir_config()
+        current_on = CFG["silent_download_mode"]
+        raw = (event.pattern_match.group(1) or "").strip().lower()
+
+        if raw in ("on", "off"):
+            if raw == "off":
+                set_env_var("SILENT_DOWNLOAD_MODE", "false")
+                reload_dir_config()
+                await event.reply("❌ 静默模式已关闭。")
+                return
+            # on：进入目录选择
+            aliases = CFG["download_dir_aliases"]
+            if not aliases:
+                await event.reply("暂未配置任何下载目录。\n请先发送 /dir 添加下载目录，再开启静默模式。")
+                return
+            await event.reply("请选择静默模式使用的下载目录：", buttons=build_silent_dir_buttons(aliases))
             return
-        if raw not in ("on", "off"):
-            await event.reply("用法：/silent on | /silent off")
-            return
-        new_val = "true" if raw == "on" else "false"
-        set_env_var("SILENT_DOWNLOAD_MODE", new_val)
-        restart_service()
-        mode_str = "开启" if raw == "on" else "关闭"
-        await event.reply("静默模式已" + mode_str + "，服务重启中...")
+
+        # 无参数：按钮菜单
+        status = "✅ 开启" if current_on else "❌ 关闭"
+        text = (
+            "🔇 静默下载模式\n\n"
+            f"当前状态：{status}\n\n"
+            "开启后会使用所选下载目录，下载时不再逐次询问目录。\n"
+            "点击下方按钮切换："
+        )
+        await event.reply(text, buttons=build_silent_buttons(current_on))
 
     @bot_client.on(events.NewMessage(pattern=r"^/default(?:\s+(.*))?$"))
     async def handle_default(event):
         raw = event.pattern_match.group(1) or ""
-        aliases_raw = get_env_var("DOWNLOAD_DIR_ALIASES", "")
-        aliases = parse_download_dir_aliases(aliases_raw)
-        current = get_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
+        reload_dir_config()
+        aliases = CFG["download_dir_aliases"]
+        current = CFG["default_download_alias"]
 
         if not raw.strip():
             if current and current in aliases:
-                await event.reply("当前默认目录：" + current + " -> " + aliases[current] + "\n设置：/default <别名>")
+                await event.reply("当前静默下载目录：" + current + " -> " + aliases[current])
             else:
-                await event.reply("当前未设置默认目录\n设置：/default <别名>")
+                await event.reply("当前未设置静默下载目录。使用 /silent 开启时选择即可。")
             return
 
         name = raw.strip()
@@ -458,9 +594,10 @@ async def main() -> None:
             await event.reply("别名 " + name + " 不存在，可用别名：" + available)
             return
         set_env_var("DEFAULT_DOWNLOAD_ALIAS", name)
-        restart_service()
-        await event.reply("默认目录已设为：" + name + " -> " + aliases[name] + "\n服务重启中...")
+        reload_dir_config()
+        await event.reply("✅ 静默下载目录已设为：" + name + " -> " + aliases[name])
 
+    @bot_client.on(events.NewMessage(pattern=r"^/pause$"))
     async def handle_pause(event):
         control = active_task.get("control")
         if not isinstance(control, TaskControl):
@@ -478,7 +615,8 @@ async def main() -> None:
         control.resume()
         last_progress = active_task.get("last_progress")
         if isinstance(last_progress, dict):
-            await event.reply(build_live_progress(last_progress))
+            builder = active_task.get("progress_builder") or build_live_progress
+            await event.reply(builder(last_progress))
         else:
             await event.reply(f"已恢复：{active_task.get('title') or active_task.get('kind')}")
 
@@ -502,7 +640,8 @@ async def main() -> None:
                 f"当前已有任务在运行：{active_task.get('title') or active_task.get('kind')}。\n请先使用 /pause、/resume 或 /stop。"
             )
             return
-        if silent_download_mode or not download_dir_aliases:
+        reload_dir_config()
+        if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
             target_dir = resolve_output_dir(None)
             target_dir.mkdir(parents=True, exist_ok=True)
             status = await event.reply(f"开始归档这条消息，输出目录：{target_dir}")
@@ -514,7 +653,7 @@ async def main() -> None:
             "payload": {"link": link.strip()},
             "created_at": time(),
         }
-        await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(download_dir_aliases))
+        await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
 
     @bot_client.on(events.NewMessage(pattern=r"^/(?:archive_channel|channel)(?:\s+(.+))?$"))
     async def handle_archive_channel(event):
@@ -547,11 +686,12 @@ async def main() -> None:
                 f"当前已有任务在运行：{active_task.get('title') or active_task.get('kind')}。\n请先使用 /pause、/resume 或 /stop。"
             )
             return
-        if silent_download_mode or not download_dir_aliases:
+        reload_dir_config()
+        if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
             target_dir = resolve_output_dir(None)
             target_dir.mkdir(parents=True, exist_ok=True)
             status = await event.reply(f"开始归档频道，准备扫描最新 {limit} 条消息。\n输出目录：{target_dir}")
-            await run_channel_task(status, link, limit, target_dir, f"{link} ({'full' if limit is None else limit})")
+            await run_channel_task(status, link, limit, target_dir, f"{link} ({limit})")
             return
 
         pending_download_choices[event.chat_id] = {
@@ -559,7 +699,7 @@ async def main() -> None:
             "payload": {"link": link, "limit": limit},
             "created_at": time(),
         }
-        await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(download_dir_aliases))
+        await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
 
     @bot_client.on(events.CallbackQuery(pattern=rb"^channel:(full|200|100|50)$"))
     async def handle_channel_choice(event):
@@ -581,7 +721,8 @@ async def main() -> None:
             await event.answer("当前已有任务在运行。", alert=True)
             return
         await event.answer()
-        if silent_download_mode or not download_dir_aliases:
+        reload_dir_config()
+        if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
             await event.edit(
                 f"开始归档频道，准备扫描{'全部可用' if limit is None else f'最新 {limit}'}条消息。"
             )
@@ -596,7 +737,7 @@ async def main() -> None:
             "payload": {"link": link, "limit": limit},
             "created_at": time(),
         }
-        await event.edit("请选择下载目录：", buttons=build_download_dir_buttons(download_dir_aliases))
+        await event.edit("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
 
     @bot_client.on(events.NewMessage(func=lambda e: bool(e.message.forward)))
     async def handle_forward(event):
@@ -606,36 +747,40 @@ async def main() -> None:
                 f"当前已有任务在运行：{active_task.get('title') or active_task.get('kind')}。\n请先使用 /pause、/resume 或 /stop。"
             )
             return
-        status = await event.reply("已收到转发消息，开始归档原消息和评论区资源。")
-        task_control = begin_task("forward", "forwarded message")
+        reload_dir_config()
+        if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
+            target_dir = resolve_output_dir(None)
+        else:
+            target_dir = output_root
+        target_dir.mkdir(parents=True, exist_ok=True)
+        status = await event.reply(f"已收到转发消息，开始归档原消息和评论区资源。\n输出目录：{target_dir}")
+        task_control = begin_task("forward", "forwarded message", status, build_live_progress)
         try:
             async def progress(info: dict) -> None:
                 active_task["last_progress"] = dict(info)
-                await status.edit(build_live_progress(info))
 
             result = await archive_forwarded_message(
                 user_client,
                 event.message.forward,
-                output_root,
+                target_dir,
                 include_comments=include_comments,
                 progress_callback=progress,
                 download_options=download_options,
                 task_control=task_control,
             )
+            clear_task()
             if not result:
                 await status.edit(
                     "这条转发消息没有暴露原频道来源信息，或者原消息没有可下载媒体。"
                 )
-                clear_task()
                 return
             await status.edit(result_summary(result))
-            clear_task()
         except ArchiveStoppedError as exc:
+            clear_task()
             await status.edit(str(exc))
-            clear_task()
         except Exception as exc:
-            await status.edit(f"Forward archive failed: {type(exc).__name__}: {exc}")
             clear_task()
+            await status.edit(f"Forward archive failed: {type(exc).__name__}: {exc}")
 
     @bot_client.on(events.CallbackQuery(pattern=rb"^dir:(.+)$"))
     async def handle_download_dir_choice(event):
@@ -644,7 +789,8 @@ async def main() -> None:
         if not pending:
             await event.answer("当前没有待选择的下载任务。", alert=True)
             return
-        if alias_name not in download_dir_aliases:
+        reload_dir_config()
+        if alias_name not in CFG["download_dir_aliases"]:
             await event.answer("目录别名不存在。", alert=True)
             return
         if current_task_running():
@@ -678,9 +824,126 @@ async def main() -> None:
             )
             return
 
+    # ----- /dir 按钮回调 -----
+    @bot_client.on(events.CallbackQuery(pattern=rb"^dirm:(add|del|list|back)$"))
+    async def handle_dirm_menu(event):
+        action = event.pattern_match.group(1).decode("utf-8")
+        reload_dir_config()
+        aliases = CFG["download_dir_aliases"]
+        await event.answer()
+        if action == "add":
+            pending_dir_add[event.chat_id] = time()
+            await event.edit(
+                "➕ 添加下载目录\n\n"
+                "请直接发送：\n"
+                "别名 路径\n\n"
+                "例如：disk1 /mnt/disk1/downloads\n"
+                "（路径须为绝对路径，以 / 开头）"
+            )
+            return
+        if action == "del":
+            if not aliases:
+                await event.edit("暂无下载目录可删除。", buttons=build_dir_menu_buttons())
+                return
+            await event.edit("🗑️ 点击要删除的目录：", buttons=build_dir_del_buttons(aliases))
+            return
+        if action == "list":
+            await event.edit(_dir_menu_text(aliases), buttons=[Button.inline("⬅️ 返回", b"dirm:back")])
+            return
+        if action == "back":
+            await event.edit(_dir_menu_text(aliases), buttons=build_dir_menu_buttons())
+            return
+
+    @bot_client.on(events.CallbackQuery(pattern=rb"^dirm:rm:(.+)$"))
+    async def handle_dirm_rm(event):
+        name = event.pattern_match.group(1).decode("utf-8")
+        reload_dir_config()
+        aliases = CFG["download_dir_aliases"]
+        if name not in aliases:
+            await event.answer("该目录已不存在。", alert=True)
+            return
+        del aliases[name]
+        combined = ";".join(f"{k}={v}" for k, v in aliases.items())
+        set_env_var("DOWNLOAD_DIR_ALIASES", combined)
+        if CFG["default_download_alias"] == name:
+            set_env_var("DEFAULT_DOWNLOAD_ALIAS", "")
+        reload_dir_config()
+        await event.answer(f"已删除 {name}")
+        await event.edit(_dir_menu_text(CFG["download_dir_aliases"]), buttons=build_dir_menu_buttons())
+
+    # ----- /silent 按钮回调 -----
+    @bot_client.on(events.CallbackQuery(pattern=rb"^silent:(on|off|back)$"))
+    async def handle_silent_cb(event):
+        action = event.pattern_match.group(1).decode("utf-8")
+        reload_dir_config()
+        if action == "off":
+            set_env_var("SILENT_DOWNLOAD_MODE", "false")
+            reload_dir_config()
+            await event.answer()
+            await event.edit(
+                "🔇 静默下载模式\n\n当前状态：❌ 关闭\n\n下载时将逐次询问下载目录。",
+                buttons=build_silent_buttons(False),
+            )
+            return
+        if action == "back":
+            current_on = CFG["silent_download_mode"]
+            status = "✅ 开启" if current_on else "❌ 关闭"
+            await event.answer()
+            await event.edit(
+                "🔇 静默下载模式\n\n"
+                f"当前状态：{status}\n\n"
+                "开启后会使用所选下载目录，下载时不再逐次询问目录。\n"
+                "点击下方按钮切换：",
+                buttons=build_silent_buttons(current_on),
+            )
+            return
+        # action == "on"：进入目录选择
+        aliases = CFG["download_dir_aliases"]
+        if not aliases:
+            await event.answer()
+            await event.edit(
+                "暂未配置任何下载目录。\n请先发送 /dir 添加下载目录，再开启静默模式。",
+                buttons=[Button.inline("⬅️ 返回", b"silent:back")],
+            )
+            return
+        await event.answer()
+        await event.edit("请选择静默模式使用的下载目录：", buttons=build_silent_dir_buttons(aliases))
+
+    @bot_client.on(events.CallbackQuery(pattern=rb"^sdir:(.+)$"))
+    async def handle_silent_dir(event):
+        name = event.pattern_match.group(1).decode("utf-8")
+        reload_dir_config()
+        aliases = CFG["download_dir_aliases"]
+        if name not in aliases:
+            await event.answer("该目录已不存在。", alert=True)
+            return
+        set_env_var("SILENT_DOWNLOAD_MODE", "true")
+        set_env_var("DEFAULT_DOWNLOAD_ALIAS", name)
+        reload_dir_config()
+        await event.answer()
+        await event.edit(
+            "✅ 静默模式已开启\n"
+            f"下载目录：{name} → {aliases[name]}\n\n"
+            "下载时将不再询问目录，直接下载到此处。"
+        )
+
     @bot_client.on(events.NewMessage(incoming=True))
     async def handle_fallback(event):
         text = event.raw_text or ""
+
+        # 拦截「添加下载目录」的文本输入
+        created = pending_dir_add.get(event.chat_id)
+        if created is not None:
+            pending_dir_add.pop(event.chat_id, None)
+            if time() - created > 300:
+                await event.reply("添加操作已超时，请重新点击「➕ 添加目录」。")
+                return
+            if text.startswith("/"):
+                await event.reply("已取消添加目录。")
+                return
+            await _do_dir_add(event, text)
+            return
+
         if text.startswith("/"):
             return
         if event.message.forward:
@@ -704,6 +967,27 @@ async def main() -> None:
 
     print("Bot is running. Press Ctrl+C to stop.")
     await bot_client.run_until_disconnected()
+
+
+async def _do_dir_add(event, text: str) -> None:
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        await event.reply("格式不对，请发送：别名 路径\n例如：disk1 /mnt/disk1/downloads")
+        return
+    alias_name = parts[0].strip()
+    alias_path = parts[1].strip()
+    if not alias_path.startswith("/"):
+        await event.reply("路径必须是绝对路径（以 / 开头）。")
+        return
+    reload_dir_config()
+    aliases = CFG["download_dir_aliases"]
+    existed = alias_name in aliases
+    aliases[alias_name] = alias_path
+    combined = ";".join(f"{k}={v}" for k, v in aliases.items())
+    set_env_var("DOWNLOAD_DIR_ALIASES", combined)
+    reload_dir_config()
+    action = "已更新" if existed else "已添加"
+    await event.reply("✅ " + action + "下载目录：" + alias_name + " -> " + alias_path)
 
 
 if __name__ == "__main__":
