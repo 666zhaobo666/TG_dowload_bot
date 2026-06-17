@@ -188,8 +188,10 @@ def main() -> None:
         print(f"Failed to write session to {output_path}: {exc}", file=sys.stderr)
         sys.exit(7)
 
-    # 这行只输出 session 本身，shell 通过 --output 读取，避免 grep tail 解析
-    print(session_string)
+    # 注意：不要把 session 打到 stdout。调用方 generate_user_session 是被
+    # $(...) 捕获的，python 的 stdout 会和函数自身的 printf 拼在一起，导致
+    # session 被写成两份（中间还夹着 print 自带的换行），写入 .env 后
+    # Telethon 反序列化失败、服务启动即崩。shell 只通过 --output 文件读取。
 
 
 if __name__ == "__main__":
