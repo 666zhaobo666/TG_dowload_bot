@@ -174,11 +174,17 @@ prompt_default() {
 
   if [[ "$secret" == "true" ]]; then
     read -r -s -p "${prompt} [${default}]: " value
-    printf "\n"
   else
     read -r -p "${prompt} [${default}]: " value
-    printf "\n"
   fi
+  # 换行只用于终端 UX，必须走 stderr：$(...) 只剥末尾换行，走 stdout 会变成
+  # 值的前导换行，导致 .env 写成 "KEY=\nVALUE"，且 api_hash 等字符串值带换行
+  # 会被 Telegram 判为无效凭据。
+  printf "\n" >&2
+
+  # 去掉粘贴时可能带入的首尾空白（例如 bot token 末尾的空格）。
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
 
   if [[ -z "$value" ]]; then
     value="$default"
@@ -482,6 +488,11 @@ _read_env_field() {
   local raw=""
   if [[ -f "$existing" ]]; then
     raw="$(grep "^${key}=" "$existing" | cut -d= -f2- || true)"
+    # 剥掉值两侧的引号（_set_env_var 写入时会加单引号），
+    # 兼容历史无引号文件与 python-dotenv 的双引号写法。
+    if [[ "$raw" == \"*\" || "$raw" == \'*\' ]]; then
+      raw="${raw:1:${#raw}-2}"
+    fi
   fi
   if [[ "$key" == "TG_USER_SESSION" ]]; then
     raw="$(_normalize_session_value "$raw")"
@@ -724,7 +735,10 @@ _set_env_var() {
     while IFS= read -r line || [[ -n "$line" ]]; do
       if [[ "$line" =~ ^${key}= ]]; then
         if [[ -n "$val" ]]; then
-          echo "${key}=${val}" >> "$tmpfile"
+          # 用单引号包裹值，避免值里的空格 / # / = 等特殊字符在解析时出错。
+          # 消费方只有 python load_dotenv()（原生支持引号）与 _read_env_field
+          # （下方已剥引号），故安全。值含单引号的情况当前配置项不会出现。
+          echo "${key}='${val}'" >> "$tmpfile"
         fi
         # val 为空时整行删除
         found=1
@@ -735,7 +749,7 @@ _set_env_var() {
   fi
 
   if [[ "$found" == "0" && -n "$val" ]]; then
-    echo "${key}=${val}" >> "$tmpfile"
+    echo "${key}='${val}'" >> "$tmpfile"
   fi
 
   run_as_root mv "$tmpfile" "$existing"
