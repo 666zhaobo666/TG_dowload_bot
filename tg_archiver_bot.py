@@ -731,18 +731,18 @@ async def main() -> None:
                 total_str = str(range_total)
                 hint = (
                     f"📊 该频道共 {total_str} 条消息。\n"
-                    f"序号说明：1 = 最新一条，{total_str} = 最旧一条。\n\n"
+                    f"序号说明：1 = 频道第一条（最旧），{total_str} = 最新一条。\n\n"
                     "请发送要下载的序号区间（两个数字，空格分隔）：\n"
-                    f"例如：1 100  → 下载第 1~100 条（最新 100 条）\n"
+                    f"例如：1 100  → 下载第 1~100 条（频道开头的最旧 100 条）\n"
                     f"例如：50 150 → 下载第 50~150 条\n"
-                    f"最大序号为 {total_str}。"
+                    f"最大序号为 {total_str}（最新一条）。"
                 )
             else:
                 hint = (
                     "📊 无法获取频道消息总数。\n\n"
                     "请发送要下载的序号区间（两个数字，空格分隔）：\n"
                     "例如：1 100\n"
-                    "（序号 1 = 最新一条，数字越大越旧）"
+                    "（序号 1 = 频道第一条/最旧，数字越大越新）"
                 )
             channel_choices.pop(chat_id, None)
             pending_channel_range[chat_id] = {"link": link, "created_at": time(), "total": range_total}

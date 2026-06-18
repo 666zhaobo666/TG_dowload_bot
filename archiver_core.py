@@ -869,17 +869,32 @@ async def archive_channel(
     failed_count = 0
     main_files = 0
     comment_files = 0
-    # 懒迭代：不再一次性把全部消息预加载进列表。全频道归档（limit=None）时避免
-    # 上万条 Message 对象常驻内存；且每条消息是按需拉取的，file_reference 更新鲜。
-    iter_kwargs: dict = {"reverse": False}
-    if limit is not None:
+    # 懒迭代 + 绝对序号截断。区间序号模型：1 = 频道第一条（最旧），N = 最新一条。
+    # 区间模式用 reverse=True 从最旧开始迭代，position 从 1 递增即「第几条」，符合自然阅读
+    # 顺序；普通模式（/channel 200 等最新 N 条）保持 reverse=False 从新到旧，行为不变。
+    # 区间模式下不用 add_offset（其边界语义随 telethon 版本变化、且与 limit 组合不可靠），
+    # 改为拉取 offset+limit 条后用 position 从第 1 条开始给绝对序号，只处理
+    # [offset+1, offset+limit]。仍是流式迭代不预加载，只是多遍历 offset 条用于跳过。
+    iter_kwargs: dict = {"reverse": bool(range_mode)}
+    if range_mode:
+        # 拉取 offset+limit 条：前 offset 条跳过，后 limit 条是目标区间。
+        fetch_count = offset + limit
+        if isinstance(total_available, int) and total_available > 0:
+            fetch_count = min(fetch_count, total_available)
+        iter_kwargs["limit"] = fetch_count
+    elif limit is not None:
         iter_kwargs["limit"] = limit
-    if offset > 0:
-        # add_offset 跳过最新的 offset 条；reverse=False 保证从新到旧，配合 limit 取区间。
-        iter_kwargs["add_offset"] = offset
+    position = 0  # 绝对序号（从1开始，1=频道第一条/最旧），用于精确截断区间
     async for message in client.iter_messages(entity, **iter_kwargs):
         if not isinstance(message, Message):
             continue
+        position += 1
+        # 区间模式精确截断：只处理 [offset+1, offset+limit]，跳过前 offset 条。
+        if range_mode:
+            if position <= offset:
+                continue
+            if position > offset + limit:
+                break
 
         if task_control:
             await task_control.checkpoint()
