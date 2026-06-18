@@ -26,6 +26,7 @@ from proxy_config import get_proxy_from_env
 channel_choices: dict[int, dict] = {}
 pending_download_choices: dict[int, dict] = {}
 pending_dir_add: dict[int, float] = {}
+pending_channel_range: dict[int, dict] = {}
 active_task: dict[str, object] = {
     "kind": None,
     "title": None,
@@ -49,6 +50,7 @@ def build_channel_choice_buttons() -> list[list[Button]]:
     return [
         [Button.inline("全部", b"channel:full"), Button.inline("最新200", b"channel:200")],
         [Button.inline("最新100", b"channel:100"), Button.inline("最新50", b"channel:50")],
+        [Button.inline("🔢 自定义范围", b"channel:custom")],
     ]
 
 
@@ -422,7 +424,7 @@ async def main() -> None:
             clear_task()
             await status_message.edit(f"Archive failed: {type(exc).__name__}: {exc}")
 
-    async def run_channel_task(status_message, link: str, limit: int | None, output_dir: Path, label: str) -> None:
+    async def run_channel_task(status_message, link: str, limit: int | None, output_dir: Path, label: str, min_id: int | None = None, max_id: int | None = None) -> None:
         task_control = begin_task("channel", label, status_message, build_channel_progress)
         try:
             async def progress(info: dict) -> None:
@@ -437,6 +439,8 @@ async def main() -> None:
                 progress_callback=progress,
                 download_options=download_options,
                 task_control=task_control,
+                min_id=min_id,
+                max_id=max_id,
             )
             failure_lines = ""
             if summary.failures:
@@ -701,7 +705,7 @@ async def main() -> None:
         }
         await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
 
-    @bot_client.on(events.CallbackQuery(pattern=rb"^channel:(full|200|100|50)$"))
+    @bot_client.on(events.CallbackQuery(pattern=rb"^channel:(full|200|100|50|custom)$"))
     async def handle_channel_choice(event):
         choice = event.pattern_match.group(1).decode("utf-8").lower()
         chat_id = event.chat_id
@@ -715,6 +719,25 @@ async def main() -> None:
             return
 
         link = pending["link"]
+        if choice == "custom":
+            # 自定义区间：先探测频道消息总数，再让用户输入起止消息 ID。
+            try:
+                range_entity = await user_client.get_entity(link)
+                range_probe = await user_client.get_messages(range_entity, limit=1)
+                range_total = getattr(range_probe, "total", None)
+            except Exception:
+                range_total = None
+            total_str = str(range_total) if isinstance(range_total, int) and range_total > 0 else "未知"
+            channel_choices.pop(chat_id, None)
+            pending_channel_range[chat_id] = {"link": link, "created_at": time()}
+            await event.answer()
+            await event.edit(
+                f"📋 该频道共 {total_str} 条消息。\n\n"
+                "请发送要下载的消息 ID 区间（两个数字，空格分隔）：\n"
+                "例如：50 150\n"
+                "（频道消息 ID 是顺序递增的，第 50 条即 ID 50）"
+            )
+            return
         limit = None if choice == "full" else int(choice)
         channel_choices.pop(chat_id, None)
         if current_task_running():
@@ -814,13 +837,21 @@ async def main() -> None:
             await run_message_task(status, payload["link"], target_dir)
             return
         if kind == "channel":
-            limit = payload["limit"]
+            limit = payload.get("limit")
+            ch_min_id = payload.get("min_id")
+            ch_max_id = payload.get("max_id")
+            if ch_min_id is not None and ch_max_id is not None:
+                ch_label = f"{payload['link']} (范围 {ch_min_id}-{ch_max_id})"
+            else:
+                ch_label = f"{payload['link']} ({'full' if limit is None else limit})"
             await run_channel_task(
                 status,
                 payload["link"],
                 limit,
                 target_dir,
-                f"{payload['link']} ({'full' if limit is None else limit})",
+                ch_label,
+                min_id=ch_min_id,
+                max_id=ch_max_id,
             )
             return
 
@@ -930,6 +961,49 @@ async def main() -> None:
     @bot_client.on(events.NewMessage(incoming=True))
     async def handle_fallback(event):
         text = event.raw_text or ""
+
+        # 拦截「频道自定义区间」的文本输入
+        range_pending = pending_channel_range.get(event.chat_id)
+        if range_pending is not None:
+            pending_channel_range.pop(event.chat_id, None)
+            if time() - range_pending.get("created_at", 0) > 600:
+                await event.reply("自定义区间输入已超时，请重新选择「自定义范围」。")
+                return
+            if text.startswith("/"):
+                await event.reply("已取消自定义区间。")
+                return
+            parts = text.strip().split()
+            if len(parts) != 2:
+                await event.reply("格式不对，请发送两个数字（空格分隔），例如：50 150")
+                return
+            try:
+                start_id = int(parts[0])
+                end_id = int(parts[1])
+            except ValueError:
+                await event.reply("请输入有效的整数，例如：50 150")
+                return
+            if start_id < 1 or end_id < 1 or start_id > end_id:
+                await event.reply("区间无效：起始和结束须为正整数且 起始 ≤ 结束。")
+                return
+            range_link = range_pending["link"]
+            if current_task_running():
+                await event.reply("当前已有任务在运行，请先停止或等待完成。")
+                return
+            reload_dir_config()
+            range_label = f"{range_link} (范围 {start_id}-{end_id})"
+            if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
+                target_dir = resolve_output_dir(None)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                status = await event.reply(f"开始归档频道，范围：{start_id}-{end_id}（共 {end_id - start_id + 1} 条）。\n输出目录：{target_dir}")
+                await run_channel_task(status, range_link, None, target_dir, range_label, min_id=start_id, max_id=end_id)
+            else:
+                pending_download_choices[event.chat_id] = {
+                    "kind": "channel",
+                    "payload": {"link": range_link, "limit": None, "min_id": start_id, "max_id": end_id},
+                    "created_at": time(),
+                }
+                await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
+            return
 
         # 拦截「添加下载目录」的文本输入
         created = pending_dir_add.get(event.chat_id)

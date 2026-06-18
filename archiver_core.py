@@ -8,7 +8,7 @@ from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
 from telethon import TelegramClient, functions
-from telethon.errors import MsgIdInvalidError
+from telethon.errors import FileReferenceExpiredError, MsgIdInvalidError
 from telethon.tl.custom.forward import Forward
 from telethon.tl.types import Message
 
@@ -447,6 +447,23 @@ async def collect_album_messages(
     return siblings or [message]
 
 
+async def _refresh_message_for_download(client: TelegramClient, message: Message) -> Message:
+    """重新拉取单条消息以获取新的 file_reference（约 1 小时过期）。
+
+    下载遇到 FileReferenceExpiredError 时用于重试。利用消息自身的 chat_id 重新查询，
+    不依赖外部 entity 变量，对主消息和评论消息都通用。
+    """
+    try:
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is not None:
+            refreshed = await client.get_messages(chat_id, ids=message.id)
+            if isinstance(refreshed, Message):
+                return refreshed
+    except Exception:
+        pass
+    return message
+
+
 async def download_messages_media(
     client: TelegramClient,
     messages: list[Message],
@@ -475,11 +492,25 @@ async def download_messages_media(
                 if progress_tracker:
                     await progress_tracker.update_file(file_key, current)
 
-            downloaded = await client.download_media(
-                item,
-                file=str(target_dir),
-                progress_callback=on_progress if progress_tracker else None,
-            )
+            media_item = item
+            try:
+                downloaded = await client.download_media(
+                    media_item,
+                    file=str(target_dir),
+                    progress_callback=on_progress if progress_tracker else None,
+                )
+            except FileReferenceExpiredError:
+                # file_reference 是短命令牌（约 1 小时过期）。频道批量下载时消息可能在很久
+                # 之前拉取，引用已过期。重新获取该消息拿到新引用后重试一次。
+                refreshed = await _refresh_message_for_download(client, media_item)
+                if refreshed is media_item:
+                    raise
+                media_item = refreshed
+                downloaded = await client.download_media(
+                    media_item,
+                    file=str(target_dir),
+                    progress_callback=on_progress if progress_tracker else None,
+                )
             if progress_tracker:
                 await progress_tracker.finish_file(file_key, total if (total := file_size) else 0)
             if not downloaded:
@@ -808,6 +839,8 @@ async def archive_channel(
     progress_callback=None,
     download_options: DownloadOptions | None = None,
     task_control: TaskControl | None = None,
+    min_id: int | None = None,
+    max_id: int | None = None,
 ) -> ChannelArchiveSummary:
     if task_control:
         await task_control.checkpoint()
@@ -819,24 +852,39 @@ async def archive_channel(
         total_available = getattr(probe, "total", None)
     except Exception:
         total_available = None
-    if limit is None:
+    # 自定义区间：min_id/max_id 同时给出时按区间扫描；limit 仅作为数量上限。
+    range_mode = min_id is not None and max_id is not None
+    if range_mode:
+        target_messages = max_id - min_id + 1
+    elif limit is None:
         target_messages = total_available if isinstance(total_available, int) and total_available > 0 else None
     else:
         target_messages = min(limit, total_available) if isinstance(total_available, int) and total_available > 0 else limit
     processed_group_ids: set[int] = set()
-    results: list[ArchiveResult] = []
     failures: list[ArchiveFailure] = []
     scanned = 0
     skipped = 0
+    archived_count = 0
+    failed_count = 0
     main_files = 0
     comment_files = 0
-    messages_to_process: list[Message] = []
-    async for message in client.iter_messages(entity, limit=limit, reverse=False):
-        if isinstance(message, Message):
-            messages_to_process.append(message)
-    messages_to_process.reverse()
+    # 懒迭代：不再一次性把全部消息预加载进列表。全频道归档（limit=None）时避免
+    # 上万条 Message 对象常驻内存；且每条消息是按需拉取的，file_reference 更新鲜。
+    iter_kwargs: dict = {"reverse": False}
+    if limit is not None:
+        iter_kwargs["limit"] = limit
+    if min_id is not None:
+        iter_kwargs["min_id"] = min_id
+    if max_id is not None:
+        iter_kwargs["max_id"] = max_id
+    async for message in client.iter_messages(entity, **iter_kwargs):
+        if not isinstance(message, Message):
+            continue
+        # 区间模式做精确过滤：min_id/max_id 的 inclusive/exclusive 语义随 telethon 版本
+        # 变化，这里保证只处理 [min_id, max_id] 范围内的消息。
+        if range_mode and (message.id < min_id or message.id > max_id):
+            continue
 
-    for message in messages_to_process:
         if task_control:
             await task_control.checkpoint()
         scanned += 1
@@ -854,9 +902,9 @@ async def archive_channel(
                         "source_chat": source_name,
                         "target_messages": target_messages,
                         "scanned": scanned,
-                        "archived": len(results),
+                        "archived": archived_count,
                         "skipped": skipped,
-                        "failed": len(failures),
+                        "failed": failed_count,
                         "main_files": main_files,
                         "comment_files": comment_files,
                         "event": "skipped",
@@ -872,9 +920,9 @@ async def archive_channel(
                         "source_chat": source_name,
                         "target_messages": target_messages,
                         "scanned": scanned,
-                        "archived": len(results),
+                        "archived": archived_count,
                         "skipped": skipped,
-                        "failed": len(failures),
+                        "failed": failed_count,
                         "main_files": main_files,
                         "comment_files": comment_files,
                         "event": "item_progress",
@@ -893,22 +941,25 @@ async def archive_channel(
                 task_control=task_control,
             )
         except Exception as exc:
-            failures.append(
-                ArchiveFailure(
-                    message_id=message.id,
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
+            failed_count += 1
+            # 仅保留前 50 条失败明细用于汇总展示，避免大频道归档时 failures 列表无限增长。
+            if len(failures) < 50:
+                failures.append(
+                    ArchiveFailure(
+                        message_id=message.id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
                 )
-            )
             if progress_callback:
                 await progress_callback(
                     {
                         "source_chat": source_name,
                         "target_messages": target_messages,
                         "scanned": scanned,
-                        "archived": len(results),
+                        "archived": archived_count,
                         "skipped": skipped,
-                        "failed": len(failures),
+                        "failed": failed_count,
                         "main_files": main_files,
                         "comment_files": comment_files,
                         "event": "failed",
@@ -919,7 +970,7 @@ async def archive_channel(
             continue
 
         if result:
-            results.append(result)
+            archived_count += 1
             main_files += len(result.main_files)
             comment_files += len(result.comment_files)
             if progress_callback:
@@ -928,9 +979,9 @@ async def archive_channel(
                         "source_chat": source_name,
                         "target_messages": target_messages,
                         "scanned": scanned,
-                        "archived": len(results),
+                        "archived": archived_count,
                         "skipped": skipped,
-                        "failed": len(failures),
+                        "failed": failed_count,
                         "main_files": main_files,
                         "comment_files": comment_files,
                         "event": "archived",
@@ -940,17 +991,18 @@ async def archive_channel(
                         "comment_count": len(result.comment_files),
                     }
                 )
+        # result 不再保留到列表：大频道归档时避免 ArchiveResult 对象无限累积导致内存膨胀。
         await asyncio.sleep(0)
     return ChannelArchiveSummary(
         source_chat=source_name,
         target_messages=target_messages,
         scanned_messages=scanned,
-        archived_messages=len(results),
+        archived_messages=archived_count,
         skipped_messages=skipped,
-        failed_messages=len(failures),
+        failed_messages=failed_count,
         main_files=main_files,
         comment_files=comment_files,
-        results=results,
+        results=[],
         failures=failures,
     )
 
