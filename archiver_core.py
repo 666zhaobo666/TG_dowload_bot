@@ -839,8 +839,7 @@ async def archive_channel(
     progress_callback=None,
     download_options: DownloadOptions | None = None,
     task_control: TaskControl | None = None,
-    min_id: int | None = None,
-    max_id: int | None = None,
+    offset: int = 0,
 ) -> ChannelArchiveSummary:
     if task_control:
         await task_control.checkpoint()
@@ -852,10 +851,12 @@ async def archive_channel(
         total_available = getattr(probe, "total", None)
     except Exception:
         total_available = None
-    # 自定义区间：min_id/max_id 同时给出时按区间扫描；limit 仅作为数量上限。
-    range_mode = min_id is not None and max_id is not None
-    if range_mode:
-        target_messages = max_id - min_id + 1
+    # 自定义区间（序号模型）：offset 表示跳过最新的 offset 条，limit 取其后 limit 条。
+    # 用户输入的是「第几条到第几条」（1=最新），而非消息 ID——频道消息 ID 非连续，
+    # 用 ID 做区间会让用户无法理解。offset>0 时进入区间模式。
+    range_mode = offset > 0
+    if range_mode and limit is not None:
+        target_messages = limit
     elif limit is None:
         target_messages = total_available if isinstance(total_available, int) and total_available > 0 else None
     else:
@@ -873,16 +874,11 @@ async def archive_channel(
     iter_kwargs: dict = {"reverse": False}
     if limit is not None:
         iter_kwargs["limit"] = limit
-    if min_id is not None:
-        iter_kwargs["min_id"] = min_id
-    if max_id is not None:
-        iter_kwargs["max_id"] = max_id
+    if offset > 0:
+        # add_offset 跳过最新的 offset 条；reverse=False 保证从新到旧，配合 limit 取区间。
+        iter_kwargs["add_offset"] = offset
     async for message in client.iter_messages(entity, **iter_kwargs):
         if not isinstance(message, Message):
-            continue
-        # 区间模式做精确过滤：min_id/max_id 的 inclusive/exclusive 语义随 telethon 版本
-        # 变化，这里保证只处理 [min_id, max_id] 范围内的消息。
-        if range_mode and (message.id < min_id or message.id > max_id):
             continue
 
         if task_control:
