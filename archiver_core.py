@@ -870,44 +870,34 @@ async def archive_channel(
     failed_count = 0
     main_files = 0
     comment_files = 0
-    # 懒迭代 + 绝对序号截断。统一用 reverse=False（从新到旧），这是 telethon 最稳定的
-    # 迭代路径，避免 reverse=True + limit 的边界问题（某些版本下会少返回消息）。
-    # 普通模式：取最新 limit 条，position 从 1（最新）递增。
-    # 区间模式：用户序号 1=最旧、N=最新。从新到旧迭代时，position 1=最新、N=最旧；
-    #   用户输入 [start, end]（从旧到新）对应从新数的 [total-end+1, total-start+1]。
-    #   因此跳过从新数的前 (total-end) 条，取其后 (end-start+1) 条。
-    iter_kwargs: dict = {"reverse": False}
+    # 懒迭代 + 绝对序号截断。
+    # 普通模式（range_mode=False）：reverse=False 从新到旧，取最新 limit 条。
+    # 区间模式（range_mode=True）：reverse=True 从旧到新，position 1=频道第一条（最旧）。
+    #   不设 limit（None=流式拉取全部），完全靠 position 精确截断 [start, end]，
+    #   避开 reverse=True + limit 的边界 bug（某些 telethon 版本会少返回消息）。
+    #   流式迭代不预加载到内存，只是多遍历前 start-1 条用于跳过。
+    iter_kwargs: dict = {}
     if range_mode:
-        # 从新到旧拉取：跳过最新 (total-end) 条，取其后 (end-start+1) 条。
-        # total_available 已知时精确计算拉取量；未知时拉取全部由 position 截断。
-        if isinstance(total_available, int) and total_available > 0:
-            # 从新数：前 skip_new = total-end 条跳过，取 limit 条。
-            skip_new = max(0, total_available - offset - limit)
-            fetch_count = skip_new + limit
-            fetch_count = min(fetch_count, total_available)
-            iter_kwargs["limit"] = fetch_count
-        else:
-            # 未知总数：拉取全部，靠 position 截断（内存风险可接受，因区间模式通常总量有限）。
-            pass
-    elif limit is not None:
-        iter_kwargs["limit"] = limit
-    position = 0  # 从新到旧的位置（1=最新，N=最旧）
+        iter_kwargs["reverse"] = True
+        # 不设 limit：拉取全部靠 position 截断。设 limit 会触发 telethon reverse 边界 bug。
+    else:
+        iter_kwargs["reverse"] = False
+        if limit is not None:
+            iter_kwargs["limit"] = limit
+    # range_mode 下 offset=start_seq-1, limit=区间长度；position 从 1=最旧 开始。
+    range_start = offset + 1          # 用户区间的起始序号
+    range_end = offset + limit        # 用户区间的结束序号
+    position = 0
     async for message in client.iter_messages(entity, **iter_kwargs):
         if not isinstance(message, Message):
             continue
         position += 1
-        # 区间模式精确截断（从新到旧计数）：
-        #   用户 [start, end]（1=最旧）=> 从新数 [skip_start+1, skip_end]
-        #   其中 skip_start = total - end, skip_end = total - start + 1
+        # 区间模式精确截断：只处理 [range_start, range_end]（闭区间，1=最旧）。
         if range_mode:
-            if isinstance(total_available, int) and total_available > 0:
-                pos_start = total_available - offset - limit + 1  # 从新数的起始位置
-                pos_end = total_available - offset                 # 从新数的结束位置
-                if position < pos_start:
-                    continue
-                if position > pos_end:
-                    break
-            # 未知总数时无法换算，退化为不截断（拉取全部）。
+            if position < range_start:
+                continue
+            if position > range_end:
+                break
 
         if task_control:
             await task_control.checkpoint()
