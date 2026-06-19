@@ -870,32 +870,44 @@ async def archive_channel(
     failed_count = 0
     main_files = 0
     comment_files = 0
-    # 懒迭代 + 绝对序号截断。区间序号模型：1 = 频道第一条（最旧），N = 最新一条。
-    # 区间模式用 reverse=True 从最旧开始迭代，position 从 1 递增即「第几条」，符合自然阅读
-    # 顺序；普通模式（/channel 200 等最新 N 条）保持 reverse=False 从新到旧，行为不变。
-    # 区间模式下不用 add_offset（其边界语义随 telethon 版本变化、且与 limit 组合不可靠），
-    # 改为拉取 offset+limit 条后用 position 从第 1 条开始给绝对序号，只处理
-    # [offset+1, offset+limit]。仍是流式迭代不预加载，只是多遍历 offset 条用于跳过。
-    iter_kwargs: dict = {"reverse": bool(range_mode)}
+    # 懒迭代 + 绝对序号截断。统一用 reverse=False（从新到旧），这是 telethon 最稳定的
+    # 迭代路径，避免 reverse=True + limit 的边界问题（某些版本下会少返回消息）。
+    # 普通模式：取最新 limit 条，position 从 1（最新）递增。
+    # 区间模式：用户序号 1=最旧、N=最新。从新到旧迭代时，position 1=最新、N=最旧；
+    #   用户输入 [start, end]（从旧到新）对应从新数的 [total-end+1, total-start+1]。
+    #   因此跳过从新数的前 (total-end) 条，取其后 (end-start+1) 条。
+    iter_kwargs: dict = {"reverse": False}
     if range_mode:
-        # 拉取 offset+limit 条：前 offset 条跳过，后 limit 条是目标区间。
-        fetch_count = offset + limit
+        # 从新到旧拉取：跳过最新 (total-end) 条，取其后 (end-start+1) 条。
+        # total_available 已知时精确计算拉取量；未知时拉取全部由 position 截断。
         if isinstance(total_available, int) and total_available > 0:
+            # 从新数：前 skip_new = total-end 条跳过，取 limit 条。
+            skip_new = max(0, total_available - offset - limit)
+            fetch_count = skip_new + limit
             fetch_count = min(fetch_count, total_available)
-        iter_kwargs["limit"] = fetch_count
+            iter_kwargs["limit"] = fetch_count
+        else:
+            # 未知总数：拉取全部，靠 position 截断（内存风险可接受，因区间模式通常总量有限）。
+            pass
     elif limit is not None:
         iter_kwargs["limit"] = limit
-    position = 0  # 绝对序号（从1开始，1=频道第一条/最旧），用于精确截断区间
+    position = 0  # 从新到旧的位置（1=最新，N=最旧）
     async for message in client.iter_messages(entity, **iter_kwargs):
         if not isinstance(message, Message):
             continue
         position += 1
-        # 区间模式精确截断：只处理 [offset+1, offset+limit]，跳过前 offset 条。
+        # 区间模式精确截断（从新到旧计数）：
+        #   用户 [start, end]（1=最旧）=> 从新数 [skip_start+1, skip_end]
+        #   其中 skip_start = total - end, skip_end = total - start + 1
         if range_mode:
-            if position <= offset:
-                continue
-            if position > offset + limit:
-                break
+            if isinstance(total_available, int) and total_available > 0:
+                pos_start = total_available - offset - limit + 1  # 从新数的起始位置
+                pos_end = total_available - offset                 # 从新数的结束位置
+                if position < pos_start:
+                    continue
+                if position > pos_end:
+                    break
+            # 未知总数时无法换算，退化为不截断（拉取全部）。
 
         if task_control:
             await task_control.checkpoint()
