@@ -48,8 +48,7 @@ CFG: dict = {
 
 def build_channel_choice_buttons() -> list[list[Button]]:
     return [
-        [Button.inline("全部", b"channel:full"), Button.inline("最新200", b"channel:200")],
-        [Button.inline("最新100", b"channel:100"), Button.inline("最新50", b"channel:50")],
+        [Button.inline("全部", b"channel:full")],
         [Button.inline("🔢 自定义范围", b"channel:custom")],
     ]
 
@@ -424,7 +423,7 @@ async def main() -> None:
             clear_task()
             await status_message.edit(f"Archive failed: {type(exc).__name__}: {exc}")
 
-    async def run_channel_task(status_message, link: str, limit: int | None, output_dir: Path, label: str, offset: int = 0) -> None:
+    async def run_channel_task(status_message, link: str, limit: int | None, output_dir: Path, label: str, offset: int = 0, range_mode: bool = False) -> None:
         task_control = begin_task("channel", label, status_message, build_channel_progress)
         try:
             async def progress(info: dict) -> None:
@@ -440,6 +439,7 @@ async def main() -> None:
                 download_options=download_options,
                 task_control=task_control,
                 offset=offset,
+                range_mode=range_mode,
             )
             failure_lines = ""
             if summary.failures:
@@ -704,7 +704,7 @@ async def main() -> None:
         }
         await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
 
-    @bot_client.on(events.CallbackQuery(pattern=rb"^channel:(full|200|100|50|custom)$"))
+    @bot_client.on(events.CallbackQuery(pattern=rb"^channel:(full|custom)$"))
     async def handle_channel_choice(event):
         choice = event.pattern_match.group(1).decode("utf-8").lower()
         chat_id = event.chat_id
@@ -719,8 +719,9 @@ async def main() -> None:
 
         link = pending["link"]
         if choice == "custom":
-            # 自定义区间（序号模型）：探测频道消息总数，让用户按序号选择区间。
-            # 序号 1 = 最新一条，N = 最旧一条；与「最新N条」的语义一致。
+            # 自定义输入：支持两种格式。
+            #   单数字 N：下载最新 N 条（从新到旧）。
+            #   区间 A B：从旧到新，1=频道第一条（最旧），下载第 A~B 条。
             try:
                 range_entity = await user_client.get_entity(link)
                 range_probe = await user_client.get_messages(range_entity, limit=1)
@@ -730,19 +731,22 @@ async def main() -> None:
             if isinstance(range_total, int) and range_total > 0:
                 total_str = str(range_total)
                 hint = (
-                    f"📊 该频道共 {total_str} 条消息。\n"
-                    f"序号说明：1 = 频道第一条（最旧），{total_str} = 最新一条。\n\n"
-                    "请发送要下载的序号区间（两个数字，空格分隔）：\n"
-                    f"例如：1 100  → 下载第 1~100 条（频道开头的最旧 100 条）\n"
-                    f"例如：50 150 → 下载第 50~150 条\n"
-                    f"最大序号为 {total_str}（最新一条）。"
+                    f"📊 该频道共 {total_str} 条消息。\n\n"
+                    "请发送数字，两种格式：\n\n"
+                    "📌 区间（两个数字，从旧到新）：\n"                    f"  序号 1 = 频道第一条（最旧），{total_str} = 最新一条\n"
+                    f"  例如：1 5   → 下载第 1~5 条（最旧的 5 条）\n"
+                    f"  例如：50 150 → 下载第 50~150 条\n"
+                    f"  最大序号 {total_str}\n\n"
+                    "📌 单数字（最新 N 条）：\n"
+                    "  例如：7   → 下载最新 7 条"
                 )
             else:
                 hint = (
                     "📊 无法获取频道消息总数。\n\n"
-                    "请发送要下载的序号区间（两个数字，空格分隔）：\n"
-                    "例如：1 100\n"
-                    "（序号 1 = 频道第一条/最旧，数字越大越新）"
+                    "请发送数字：\n"
+                    "  区间（两个数字）：1 5 → 从旧到新下载第 1~5 条\n"
+                    "  单数字：7 → 下载最新 7 条\n"
+                    "（区间序号 1 = 频道第一条/最旧）"
                 )
             channel_choices.pop(chat_id, None)
             pending_channel_range[chat_id] = {"link": link, "created_at": time(), "total": range_total}
@@ -850,7 +854,8 @@ async def main() -> None:
         if kind == "channel":
             limit = payload.get("limit")
             ch_offset = payload.get("offset", 0)
-            if ch_offset > 0 and limit is not None:
+            ch_range_mode = payload.get("range_mode", False)
+            if ch_range_mode and limit is not None:
                 ch_label = f"{payload['link']} (序号 {ch_offset + 1}-{ch_offset + limit})"
             else:
                 ch_label = f"{payload['link']} ({'full' if limit is None else limit})"
@@ -861,6 +866,7 @@ async def main() -> None:
                 target_dir,
                 ch_label,
                 offset=ch_offset,
+                range_mode=ch_range_mode,
             )
             return
 
@@ -971,55 +977,84 @@ async def main() -> None:
     async def handle_fallback(event):
         text = event.raw_text or ""
 
-        # 拦截「频道自定义区间」的文本输入（序号模型：1=最新，N=最旧）
+        # 拦截「频道自定义」的文本输入。两种格式：
+        #   单数字 N：最新 N 条（从新到旧，range_mode=False）。
+        #   区间 A B：从旧到新，1=频道第一条（最旧），第 A~B 条（range_mode=True）。
         range_pending = pending_channel_range.get(event.chat_id)
         if range_pending is not None:
             pending_channel_range.pop(event.chat_id, None)
             if time() - range_pending.get("created_at", 0) > 600:
-                await event.reply("自定义区间输入已超时，请重新选择「自定义范围」。")
+                await event.reply("自定义输入已超时，请重新选择「自定义范围」。")
                 return
             if text.startswith("/"):
-                await event.reply("已取消自定义区间。")
+                await event.reply("已取消自定义范围。")
                 return
             parts = text.strip().split()
-            if len(parts) != 2:
-                await event.reply("格式不对，请发送两个数字（空格分隔），例如：1 100")
-                return
-            try:
-                start_seq = int(parts[0])
-                end_seq = int(parts[1])
-            except ValueError:
-                await event.reply("请输入有效的整数，例如：1 100")
-                return
-            if start_seq < 1 or end_seq < 1 or start_seq > end_seq:
-                await event.reply("区间无效：起始和结束须为正整数且 起始 ≤ 结束。")
-                return
-            range_total = range_pending.get("total")
-            if isinstance(range_total, int) and range_total > 0 and end_seq > range_total:
-                await event.reply(f"结束序号 {end_seq} 超过频道总消息数 {range_total}，请重新输入。")
-                return
             range_link = range_pending["link"]
+            range_total = range_pending.get("total")
             if current_task_running():
                 await event.reply("当前已有任务在运行，请先停止或等待完成。")
                 return
-            # 序号 -> offset/limit：1=最新，offset=start_seq-1 跳过最新若干条，
-            # limit=end_seq-start_seq+1 取该区间。
-            range_offset = start_seq - 1
-            range_limit = end_seq - start_seq + 1
             reload_dir_config()
-            range_label = f"{range_link} (序号 {start_seq}-{end_seq})"
-            if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
-                target_dir = resolve_output_dir(None)
-                target_dir.mkdir(parents=True, exist_ok=True)
-                status = await event.reply(f"开始归档频道，序号 {start_seq}-{end_seq}（共 {range_limit} 条）。\n输出目录：{target_dir}")
-                await run_channel_task(status, range_link, range_limit, target_dir, range_label, offset=range_offset)
-            else:
-                pending_download_choices[event.chat_id] = {
-                    "kind": "channel",
-                    "payload": {"link": range_link, "limit": range_limit, "offset": range_offset},
-                    "created_at": time(),
-                }
-                await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
+            if len(parts) == 1:
+                # 单数字：最新 N 条
+                try:
+                    single_n = int(parts[0])
+                except ValueError:
+                    await event.reply("请输入有效的整数，例如：7 或 1 5")
+                    return
+                if single_n < 1:
+                    await event.reply("数量必须为正整数。")
+                    return
+                if isinstance(range_total, int) and range_total > 0 and single_n > range_total:
+                    single_n = range_total
+                range_label = f"{range_link} (最新 {single_n} 条)"
+                if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
+                    target_dir = resolve_output_dir(None)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    status = await event.reply(f"开始归档频道，最新 {single_n} 条。\n输出目录：{target_dir}")
+                    await run_channel_task(status, range_link, single_n, target_dir, range_label)
+                else:
+                    pending_download_choices[event.chat_id] = {
+                        "kind": "channel",
+                        "payload": {"link": range_link, "limit": single_n, "offset": 0, "range_mode": False},
+                        "created_at": time(),
+                    }
+                    await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
+                return
+            if len(parts) == 2:
+                # 区间：从旧到新，1=频道第一条（最旧）
+                try:
+                    start_seq = int(parts[0])
+                    end_seq = int(parts[1])
+                except ValueError:
+                    await event.reply("请输入有效的整数，例如：1 5 或 7")
+                    return
+                if start_seq < 1 or end_seq < 1 or start_seq > end_seq:
+                    await event.reply("区间无效：起始和结束须为正整数且 起始 ≤ 结束。")
+                    return
+                if isinstance(range_total, int) and range_total > 0 and end_seq > range_total:
+                    await event.reply(f"结束序号 {end_seq} 超过频道总消息数 {range_total}，请重新输入。")
+                    return
+                # 序号 -> offset/limit：从旧到新迭代（reverse=True），offset=start_seq-1
+                # 跳过最旧的前若干条，limit=end_seq-start_seq+1 取该区间。
+                range_offset = start_seq - 1
+                range_limit = end_seq - start_seq + 1
+                range_label = f"{range_link} (序号 {start_seq}-{end_seq})"
+                if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
+                    target_dir = resolve_output_dir(None)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    status = await event.reply(f"开始归档频道，序号 {start_seq}-{end_seq}（共 {range_limit} 条，从旧到新）。\n输出目录：{target_dir}")
+                    await run_channel_task(status, range_link, range_limit, target_dir, range_label, offset=range_offset, range_mode=True)
+                else:
+                    pending_download_choices[event.chat_id] = {
+                        "kind": "channel",
+                        "payload": {"link": range_link, "limit": range_limit, "offset": range_offset, "range_mode": True},
+                        "created_at": time(),
+                    }
+                    await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
+                return
+            await event.reply("格式不对，请发送一个数字（如 7）或两个数字（如 1 5）。")
             return
 
         # 拦截「添加下载目录」的文本输入

@@ -840,6 +840,7 @@ async def archive_channel(
     download_options: DownloadOptions | None = None,
     task_control: TaskControl | None = None,
     offset: int = 0,
+    range_mode: bool = False,
 ) -> ChannelArchiveSummary:
     if task_control:
         await task_control.checkpoint()
@@ -852,9 +853,9 @@ async def archive_channel(
     except Exception:
         total_available = None
     # 自定义区间（序号模型）：offset 表示跳过最新的 offset 条，limit 取其后 limit 条。
-    # 用户输入的是「第几条到第几条」（1=最新），而非消息 ID——频道消息 ID 非连续，
-    # 用 ID 做区间会让用户无法理解。offset>0 时进入区间模式。
-    range_mode = offset > 0
+    # range_mode 由调用方显式传入：True=区间模式（从旧到新，1=频道第一条），
+    # False=普通模式（最新 N 条，从新到旧）。不再从 offset 推断，避免 offset=0 的
+    # 区间（如 1 5）被误判为普通模式。
     if range_mode and limit is not None:
         target_messages = limit
     elif limit is None:
