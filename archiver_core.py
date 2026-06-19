@@ -679,7 +679,19 @@ async def archive_message(
     if task_control:
         await task_control.checkpoint()
     album = [message] if force_single else await collect_album_messages(client, entity, message)
-    if not any(has_media(item) for item in album):
+    main_has_media = any(has_media(item) for item in album)
+    # 先准备评论区分组，用于判断「主消息无媒体但评论区有媒体」的情况。
+    # 某些频道主贴只有文字，图片/视频全在评论区——这类消息也要归档（main 目录留空，
+    # 仅下载评论区资源），而不是直接跳过。
+    prepared_comment_groups: list[list[Message]] = []
+    prepared_comment_notes: list[str] = []
+    if include_comments:
+        if task_control:
+            await task_control.checkpoint()
+        prepared_comment_groups, prepared_comment_notes = await prepare_comment_groups(client, entity, message)
+    comments_have_media = any(has_media(item) for group in prepared_comment_groups for item in group)
+    if not main_has_media and not comments_have_media:
+        # 主消息和评论区都无媒体，确实没有可下载资源，才跳过。
         return None
 
     source_name = await resolve_entity_name(client, entity)
@@ -688,12 +700,6 @@ async def archive_message(
     archive_dir.mkdir(parents=True, exist_ok=False)
     download_options = download_options or DownloadOptions()
     raw_text = message.message.strip() if message.message else "(no text)"
-    prepared_comment_groups: list[list[Message]] = []
-    prepared_comment_notes: list[str] = []
-    if include_comments:
-        if task_control:
-            await task_control.checkpoint()
-        prepared_comment_groups, prepared_comment_notes = await prepare_comment_groups(client, entity, message)
     write_readme(
         archive_dir=archive_dir,
         title=folder_name,
