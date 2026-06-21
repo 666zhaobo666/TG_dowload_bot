@@ -392,6 +392,21 @@ def group_thread_messages(messages: list[Message]) -> list[list[Message]]:
     return groups
 
 
+async def count_channel_message_groups(client: TelegramClient, entity) -> int:
+    grouped_ids: set[int] = set()
+    total_groups = 0
+    async for message in client.iter_messages(entity, reverse=True):
+        if not isinstance(message, Message):
+            continue
+        group_id = getattr(message, "grouped_id", None)
+        if group_id:
+            if group_id in grouped_ids:
+                continue
+            grouped_ids.add(group_id)
+        total_groups += 1
+    return total_groups
+
+
 async def collect_album_messages(
     client: TelegramClient,
     entity,
@@ -677,10 +692,11 @@ async def archive_message(
     force_single: bool = False,
     download_options: DownloadOptions | None = None,
     task_control: TaskControl | None = None,
+    prepared_album: list[Message] | None = None,
 ) -> ArchiveResult | None:
     if task_control:
         await task_control.checkpoint()
-    album = [message] if force_single else await collect_album_messages(client, entity, message)
+    album = prepared_album if prepared_album is not None else ([message] if force_single else await collect_album_messages(client, entity, message))
     main_has_media = any(has_media(item) for item in album)
     # 先准备评论区分组，用于判断「主消息无媒体但评论区有媒体」的情况。
     # 某些频道主贴只有文字，图片/视频全在评论区——这类消息也要归档（main 目录留空，
@@ -699,20 +715,24 @@ async def archive_message(
         return None
 
     source_name = await resolve_entity_name(client, entity)
-    folder_name = build_folder_name(source_name, message.id)
+    # 相册（album）的命名锚点：取最小 id 那条（最旧，通常是带 caption 的第一张），
+    # 这样文件夹名、README、meta 都以「帖子的第一条」为准，与 t.me/<channel>/<min_id> 一致。
+    # 单条消息时 anchor 即 message 本身。
+    anchor = album[0] if album else message
+    folder_name = build_folder_name(source_name, anchor.id)
     archive_dir = ensure_unique_dir(output_dir / folder_name)
     archive_dir.mkdir(parents=True, exist_ok=False)
     download_options = download_options or DownloadOptions()
     # 相册的 caption 通常只在其中一条消息上，从相册里取有文字的那条，避免 channel
     # 模式遍历到非 caption 项时 README 丢失简介文字。
-    text_source = next((item for item in album if item.message and item.message.strip()), message)
+    text_source = next((item for item in album if item.message and item.message.strip()), anchor)
     raw_text = text_source.message.strip() if text_source.message else "(no text)"
     write_readme(
         archive_dir=archive_dir,
         title=folder_name,
         source_name=source_name,
-        message_id=message.id,
-        published_at=message.date.isoformat(),
+        message_id=anchor.id,
+        published_at=anchor.date.isoformat(),
         raw_text=raw_text,
         main_files=[],
         comment_files=[],
@@ -728,7 +748,7 @@ async def archive_message(
         {
             "stage": "downloading",
             "source_chat": source_name,
-            "message_id": message.id,
+            "message_id": anchor.id,
             "title": folder_name,
             "folder": str(archive_dir),
             "single": force_single,
@@ -743,7 +763,7 @@ async def archive_message(
             {
                 "stage": "main_start",
                 "source_chat": source_name,
-                "message_id": message.id,
+                "message_id": anchor.id,
                 "title": folder_name,
                 "folder": str(archive_dir),
                 "single": force_single,
@@ -762,7 +782,7 @@ async def archive_message(
             {
                 "stage": "main_done",
                 "source_chat": source_name,
-                "message_id": message.id,
+                "message_id": anchor.id,
                 "title": folder_name,
                 "folder": str(archive_dir),
                 "main_count": len(main_files),
@@ -777,7 +797,7 @@ async def archive_message(
                 {
                     "stage": "comments_start",
                     "source_chat": source_name,
-                    "message_id": message.id,
+                    "message_id": anchor.id,
                     "title": folder_name,
                     "folder": str(archive_dir),
                     "main_count": len(main_files),
@@ -800,7 +820,7 @@ async def archive_message(
                 {
                     "stage": "comments_done",
                     "source_chat": source_name,
-                    "message_id": message.id,
+                    "message_id": anchor.id,
                     "title": folder_name,
                     "folder": str(archive_dir),
                     "main_count": len(main_files),
@@ -813,8 +833,8 @@ async def archive_message(
         archive_dir=archive_dir,
         title=folder_name,
         source_name=source_name,
-        message_id=message.id,
-        published_at=message.date.isoformat(),
+        message_id=anchor.id,
+        published_at=anchor.date.isoformat(),
         raw_text=raw_text,
         main_files=main_files,
         comment_files=comment_files,
@@ -823,7 +843,7 @@ async def archive_message(
 
     meta = {
         "source_chat": source_name,
-        "message_id": message.id,
+        "message_id": anchor.id,
         "title": folder_name,
         "main_files": main_files,
         "comment_files": comment_files,
@@ -835,7 +855,7 @@ async def archive_message(
     return ArchiveResult(
         folder=archive_dir,
         source_chat=source_name,
-        message_id=message.id,
+        message_id=anchor.id,
         title=folder_name,
         main_files=main_files,
         comment_files=comment_files,
@@ -860,21 +880,26 @@ async def archive_channel(
     entity = await client.get_entity(chat)
     source_name = await resolve_entity_name(client, entity)
     total_available = None
-    try:
-        probe = await client.get_messages(entity, limit=1)
-        total_available = getattr(probe, "total", None)
-    except Exception:
-        total_available = None
-    # 自定义区间（序号模型）：offset 表示跳过最新的 offset 条，limit 取其后 limit 条。
-    # range_mode 由调用方显式传入：True=区间模式（从旧到新，1=频道第一条），
-    # False=普通模式（最新 N 条，从新到旧）。不再从 offset 推断，避免 offset=0 的
+    # 这里的“数量 / 序号”统一按 message group 计算：
+    # - 单条普通消息 = 1 group
+    # - 一个 album / grouped_id = 1 group
+    # 也就是最终归档后生成的文件夹数量。
+    #
+    # 自定义区间（序号模型）：offset 表示跳过最新的 offset 个 group，limit 取其后 limit 个 group。
+    # range_mode 由调用方显式传入：True=区间模式（从旧到新，1=频道第一个 group），
+    # False=普通模式（最新 N 个 group，从新到旧）。不再从 offset 推断，避免 offset=0 的
     # 区间（如 1 5）被误判为普通模式。
+    if limit is None:
+        try:
+            total_available = await count_channel_message_groups(client, entity)
+        except Exception:
+            total_available = None
     if range_mode and limit is not None:
         target_messages = limit
     elif limit is None:
         target_messages = total_available if isinstance(total_available, int) and total_available > 0 else None
     else:
-        target_messages = min(limit, total_available) if isinstance(total_available, int) and total_available > 0 else limit
+        target_messages = limit
     processed_group_ids: set[int] = set()
     failures: list[ArchiveFailure] = []
     scanned = 0
@@ -883,45 +908,42 @@ async def archive_channel(
     failed_count = 0
     main_files = 0
     comment_files = 0
-    # 懒迭代 + 绝对序号截断。
-    # 普通模式（range_mode=False）：reverse=False 从新到旧，取最新 limit 条。
-    # 区间模式（range_mode=True）：reverse=True 从旧到新，position 1=频道第一条（最旧）。
-    #   不设 limit（None=流式拉取全部），完全靠 position 精确截断 [start, end]，
-    #   避开 reverse=True + limit 的边界 bug（某些 telethon 版本会少返回消息）。
-    #   流式迭代不预加载到内存，只是多遍历前 start-1 条用于跳过。
+    # 懒迭代 + group 级序号截断。
+    # 普通模式（range_mode=False）：reverse=False 从新到旧，取最新 limit 个 group。
+    # 区间模式（range_mode=True）：reverse=True 从旧到新，position 1=频道第一个 group（最旧）。
     iter_kwargs: dict = {}
     if range_mode:
         iter_kwargs["reverse"] = True
-        # 不设 limit：拉取全部靠 position 截断。设 limit 会触发 telethon reverse 边界 bug。
     else:
         iter_kwargs["reverse"] = False
-        if limit is not None:
-            iter_kwargs["limit"] = limit
-    # range_mode 下 offset=start_seq-1, limit=区间长度；position 从 1=最旧 开始。
-    range_start = offset + 1          # 用户区间的起始序号
-    range_end = offset + limit        # 用户区间的结束序号
+    # range_mode 下 offset=start_seq-1, limit=区间长度；position 从 1=最旧开始。
+    range_start = offset + 1
+    range_end = offset + limit if limit is not None else None
     position = 0
     async for message in client.iter_messages(entity, **iter_kwargs):
         if not isinstance(message, Message):
             continue
-        position += 1
-        # 区间模式精确截断：只处理 [range_start, range_end]（闭区间，1=最旧）。
-        if range_mode:
-            if position < range_start:
-                continue
-            if position > range_end:
-                break
-
-        if task_control:
-            await task_control.checkpoint()
-        scanned += 1
         group_id = getattr(message, "grouped_id", None)
         if group_id and group_id in processed_group_ids:
             continue
         if group_id:
             processed_group_ids.add(group_id)
+        position += 1
+        if range_mode:
+            if position < range_start:
+                continue
+            if range_end is not None and position > range_end:
+                break
+        elif limit is not None and scanned >= limit:
+            break
 
-        if is_message_archived(output_dir, source_name, message.id):
+        if task_control:
+            await task_control.checkpoint()
+        scanned += 1
+        album = [message] if not group_id else await collect_album_messages(client, entity, message)
+        anchor = album[0] if album else message
+
+        if is_message_archived(output_dir, source_name, anchor.id):
             skipped += 1
             if progress_callback:
                 await progress_callback(
@@ -935,7 +957,7 @@ async def archive_channel(
                         "main_files": main_files,
                         "comment_files": comment_files,
                         "event": "skipped",
-                        "message_id": message.id,
+                        "message_id": anchor.id,
                     }
                 )
             continue
@@ -966,6 +988,7 @@ async def archive_channel(
                 progress_callback=item_progress,
                 download_options=download_options,
                 task_control=task_control,
+                prepared_album=album,
             )
         except Exception as exc:
             failed_count += 1
@@ -990,7 +1013,7 @@ async def archive_channel(
                         "main_files": main_files,
                         "comment_files": comment_files,
                         "event": "failed",
-                        "message_id": message.id,
+                        "message_id": anchor.id,
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )

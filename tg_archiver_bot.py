@@ -15,6 +15,7 @@ from archiver_core import (
     archive_forwarded_message,
     archive_message_by_link,
     ChannelArchiveSummary,
+    count_channel_message_groups,
     DownloadOptions,
     TaskControl,
     clamp_concurrency,
@@ -342,8 +343,8 @@ def build_channel_progress(info: dict) -> str:
     latest = info.get("title") or f"message {info.get('message_id')}"
     lines = [
         "归档中...",
-        f"消息：{info.get('scanned', 0)}/{info.get('target_messages', '?') or 'full'}",
-        f"已扫描：{info.get('scanned', 0)}",
+        f"Message group：{info.get('scanned', 0)}/{info.get('target_messages', '?') or 'full'}",
+        f"已扫描 group：{info.get('scanned', 0)}",
         f"已归档：{info.get('archived', 0)}",
         f"已跳过：{info.get('skipped', 0)}",
         f"失败：{info.get('failed', 0)}",
@@ -452,7 +453,7 @@ async def main() -> None:
             await status_message.edit(
                 "频道归档完成\n"
                 f"来源：{summary.source_chat}\n"
-                f"消息：{summary.scanned_messages}/{summary.target_messages or 'full'}\n"
+                f"Message group：{summary.scanned_messages}/{summary.target_messages or 'full'}\n"
                 f"已归档：{summary.archived_messages}\n"
                 f"已跳过：{summary.skipped_messages}\n"
                 f"失败：{summary.failed_messages}\n"
@@ -693,7 +694,7 @@ async def main() -> None:
         if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
             target_dir = resolve_output_dir(None)
             target_dir.mkdir(parents=True, exist_ok=True)
-            status = await event.reply(f"开始归档频道，准备扫描最新 {limit} 条消息。\n输出目录：{target_dir}")
+            status = await event.reply(f"开始归档频道，准备扫描最新 {limit} 个 message group。\n输出目录：{target_dir}")
             await run_channel_task(status, link, limit, target_dir, f"{link} ({limit})")
             return
 
@@ -720,33 +721,33 @@ async def main() -> None:
         link = pending["link"]
         if choice == "custom":
             # 自定义输入：支持两种格式。
-            #   单数字 N：下载最新 N 条（从新到旧）。
-            #   区间 A B：从旧到新，1=频道第一条（最旧），下载第 A~B 条。
+            #   单数字 N：下载最新 N 个 message group（从新到旧）。
+            #   区间 A B：从旧到新，1=频道第一个 message group（最旧），下载第 A~B 个 group。
             try:
                 range_entity = await user_client.get_entity(link)
-                range_probe = await user_client.get_messages(range_entity, limit=1)
-                range_total = getattr(range_probe, "total", None)
+                range_total = await count_channel_message_groups(user_client, range_entity)
             except Exception:
                 range_total = None
             if isinstance(range_total, int) and range_total > 0:
                 total_str = str(range_total)
                 hint = (
-                    f"📊 该频道共 {total_str} 条消息。\n\n"
+                    f"📊 该频道共 {total_str} 个 message group。\n\n"
                     "请发送数字，两种格式：\n\n"
-                    "📌 区间（两个数字，从旧到新）：\n"                    f"  序号 1 = 频道第一条（最旧），{total_str} = 最新一条\n"
-                    f"  例如：1 5   → 下载第 1~5 条（最旧的 5 条）\n"
-                    f"  例如：50 150 → 下载第 50~150 条\n"
+                    "📌 区间（两个数字，从旧到新）：\n"
+                    f"  序号 1 = 第一个 message group（最旧），{total_str} = 最新一个\n"
+                    f"  例如：1 5   → 下载第 1~5 个 group\n"
+                    f"  例如：50 150 → 下载第 50~150 个 group\n"
                     f"  最大序号 {total_str}\n\n"
-                    "📌 单数字（最新 N 条）：\n"
-                    "  例如：7   → 下载最新 7 条"
+                    "📌 单数字（最新 N 个 group）：\n"
+                    "  例如：7   → 下载最新 7 个 group"
                 )
             else:
                 hint = (
-                    "📊 无法获取频道消息总数。\n\n"
+                    "📊 无法获取频道 message group 总数。\n\n"
                     "请发送数字：\n"
-                    "  区间（两个数字）：1 5 → 从旧到新下载第 1~5 条\n"
-                    "  单数字：7 → 下载最新 7 条\n"
-                    "（区间序号 1 = 频道第一条/最旧）"
+                    "  区间（两个数字）：1 5 → 从旧到新下载第 1~5 个 group\n"
+                    "  单数字：7 → 下载最新 7 个 group\n"
+                    "（区间序号 1 = 频道第一个 group / 最旧）"
                 )
             channel_choices.pop(chat_id, None)
             pending_channel_range[chat_id] = {"link": link, "created_at": time(), "total": range_total}
@@ -762,7 +763,7 @@ async def main() -> None:
         reload_dir_config()
         if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
             await event.edit(
-                f"开始归档频道，准备扫描{'全部可用' if limit is None else f'最新 {limit}'}条消息。"
+                f"开始归档频道，准备扫描{'全部可用' if limit is None else f'最新 {limit} 个 message group'}。"
             )
             status = await event.get_message()
             target_dir = resolve_output_dir(None)
@@ -978,8 +979,8 @@ async def main() -> None:
         text = event.raw_text or ""
 
         # 拦截「频道自定义」的文本输入。两种格式：
-        #   单数字 N：最新 N 条（从新到旧，range_mode=False）。
-        #   区间 A B：从旧到新，1=频道第一条（最旧），第 A~B 条（range_mode=True）。
+        #   单数字 N：最新 N 个 message group（从新到旧，range_mode=False）。
+        #   区间 A B：从旧到新，1=频道第一个 message group（最旧），第 A~B 个 group（range_mode=True）。
         range_pending = pending_channel_range.get(event.chat_id)
         if range_pending is not None:
             pending_channel_range.pop(event.chat_id, None)
@@ -997,7 +998,7 @@ async def main() -> None:
                 return
             reload_dir_config()
             if len(parts) == 1:
-                # 单数字：最新 N 条
+                # 单数字：最新 N 个 message group
                 try:
                     single_n = int(parts[0])
                 except ValueError:
@@ -1008,11 +1009,11 @@ async def main() -> None:
                     return
                 if isinstance(range_total, int) and range_total > 0 and single_n > range_total:
                     single_n = range_total
-                range_label = f"{range_link} (最新 {single_n} 条)"
+                range_label = f"{range_link} (最新 {single_n} 个 group)"
                 if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
                     target_dir = resolve_output_dir(None)
                     target_dir.mkdir(parents=True, exist_ok=True)
-                    status = await event.reply(f"开始归档频道，最新 {single_n} 条。\n输出目录：{target_dir}")
+                    status = await event.reply(f"开始归档频道，最新 {single_n} 个 message group。\n输出目录：{target_dir}")
                     await run_channel_task(status, range_link, single_n, target_dir, range_label)
                 else:
                     pending_download_choices[event.chat_id] = {
@@ -1023,7 +1024,7 @@ async def main() -> None:
                     await event.reply("请选择下载目录：", buttons=build_download_dir_buttons(CFG["download_dir_aliases"]))
                 return
             if len(parts) == 2:
-                # 区间：从旧到新，1=频道第一条（最旧）
+                # 区间：从旧到新，1=频道第一个 message group（最旧）
                 try:
                     start_seq = int(parts[0])
                     end_seq = int(parts[1])
@@ -1034,17 +1035,17 @@ async def main() -> None:
                     await event.reply("区间无效：起始和结束须为正整数且 起始 ≤ 结束。")
                     return
                 if isinstance(range_total, int) and range_total > 0 and end_seq > range_total:
-                    await event.reply(f"结束序号 {end_seq} 超过频道总消息数 {range_total}，请重新输入。")
+                    await event.reply(f"结束序号 {end_seq} 超过频道总 message group 数 {range_total}，请重新输入。")
                     return
                 # 序号 -> offset/limit：从旧到新迭代（reverse=True），offset=start_seq-1
-                # 跳过最旧的前若干条，limit=end_seq-start_seq+1 取该区间。
+                # 跳过最旧的前若干个 group，limit=end_seq-start_seq+1 取该区间。
                 range_offset = start_seq - 1
                 range_limit = end_seq - start_seq + 1
                 range_label = f"{range_link} (序号 {start_seq}-{end_seq})"
                 if CFG["silent_download_mode"] or not CFG["download_dir_aliases"]:
                     target_dir = resolve_output_dir(None)
                     target_dir.mkdir(parents=True, exist_ok=True)
-                    status = await event.reply(f"开始归档频道，序号 {start_seq}-{end_seq}（共 {range_limit} 条，从旧到新）。\n输出目录：{target_dir}")
+                    status = await event.reply(f"开始归档频道，序号 {start_seq}-{end_seq}（共 {range_limit} 个 message group，从旧到新）。\n输出目录：{target_dir}")
                     await run_channel_task(status, range_link, range_limit, target_dir, range_label, offset=range_offset, range_mode=True)
                 else:
                     pending_download_choices[event.chat_id] = {
