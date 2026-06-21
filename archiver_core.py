@@ -233,10 +233,12 @@ def write_readme(
     ]
     if selected_comment_id is not None:
         lines.append(f"- Selected comment ID: `{selected_comment_id}`")
+    # Markdown 中单换行会被合并成空格，加两个空格强制换行，保留原始格式。
+    raw_text_md = raw_text.replace("\n", "  \n") if raw_text else raw_text
     lines.extend(
         [
             "## Description",
-            raw_text,
+            raw_text_md,
             "## Files",
             *[f"- `{name}`" for name in main_files],
             *[f"- `{name}`" for name in comment_files],
@@ -690,8 +692,10 @@ async def archive_message(
             await task_control.checkpoint()
         prepared_comment_groups, prepared_comment_notes = await prepare_comment_groups(client, entity, message)
     comments_have_media = any(has_media(item) for group in prepared_comment_groups for item in group)
-    if not main_has_media and not comments_have_media:
-        # 主消息和评论区都无媒体，确实没有可下载资源，才跳过。
+    # 纯文字消息（无媒体、无评论媒体）也归档：保留简介文字到 README，只是不下载媒体文件。
+    # 仅当既无媒体又无文字时才跳过。
+    has_text = bool(message.message and message.message.strip())
+    if not main_has_media and not comments_have_media and not has_text:
         return None
 
     source_name = await resolve_entity_name(client, entity)
@@ -699,7 +703,10 @@ async def archive_message(
     archive_dir = ensure_unique_dir(output_dir / folder_name)
     archive_dir.mkdir(parents=True, exist_ok=False)
     download_options = download_options or DownloadOptions()
-    raw_text = message.message.strip() if message.message else "(no text)"
+    # 相册的 caption 通常只在其中一条消息上，从相册里取有文字的那条，避免 channel
+    # 模式遍历到非 caption 项时 README 丢失简介文字。
+    text_source = next((item for item in album if item.message and item.message.strip()), message)
+    raw_text = text_source.message.strip() if text_source.message else "(no text)"
     write_readme(
         archive_dir=archive_dir,
         title=folder_name,
@@ -1069,7 +1076,10 @@ async def archive_message_by_link(
         archive_dir = ensure_unique_dir(output_dir / folder_name)
         archive_dir.mkdir(parents=True, exist_ok=False)
         download_options = download_options or DownloadOptions()
-        raw_text = root_message.message.strip() if root_message.message else "(no text)"
+        main_album = [root_message] if parsed.single else await collect_album_messages(client, entity, root_message)
+        # 相册 caption 通常只在其中一条，取有文字的那条
+        text_source = next((item for item in main_album if item.message and item.message.strip()), root_message)
+        raw_text = text_source.message.strip() if text_source.message else "(no text)"
         write_readme(
             archive_dir=archive_dir,
             title=folder_name,
@@ -1095,7 +1105,6 @@ async def archive_message_by_link(
                     "single": parsed.single,
                 }
             )
-        main_album = [root_message] if parsed.single else await collect_album_messages(client, entity, root_message)
         total_bytes = sum(media_size(item) for item in main_album) + sum(media_size(item) for item in selected_group)
         progress_tracker = DownloadProgressTracker(
             progress_callback,
